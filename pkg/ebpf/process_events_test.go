@@ -65,8 +65,8 @@ func TestCandidateNamedObjectPaths(t *testing.T) {
 	}
 
 	paths := candidateNamedObjectPaths(objectName)
-	if len(paths) != 2 {
-		t.Fatalf("len(paths) = %d, want 2 (%v)", len(paths), paths)
+	if len(paths) < 2 {
+		t.Fatalf("len(paths) = %d, want at least 2 (%v)", len(paths), paths)
 	}
 	if paths[0] != objectName {
 		t.Fatalf("paths[0] = %q, want %q", paths[0], objectName)

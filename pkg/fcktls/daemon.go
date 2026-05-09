@@ -30,12 +30,15 @@ type Daemon struct {
 	Config        Config
 	ProcessEvents processEventReader
 	OpenSSL       openSSLReader
+	Inspector     OpenSSLInspector
 	Monitor       ProcessMonitor
 	LibraryFinder func() ([]string, error)
 	Now           func() time.Time
 	Stdout        io.Writer
 	Artifacts     ArtifactWriter
 	Store         *SessionStore
+
+	inspectedSessions map[SessionKey]bool
 }
 
 func NewDaemon(cfg Config) (*Daemon, error) {
@@ -53,6 +56,7 @@ func NewDaemon(cfg Config) (*Daemon, error) {
 		Config:        cfg,
 		ProcessEvents: processEvents,
 		OpenSSL:       openssl,
+		Inspector:     newDefaultOpenSSLInspector(),
 		Monitor:       NewProcessMonitor(cfg.Target, nil),
 		LibraryFinder: discoverOpenSSLLibraries,
 		Now:           time.Now,
@@ -77,6 +81,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	if d.Store == nil {
 		d.Store = NewSessionStore()
+	}
+	if d.inspectedSessions == nil {
+		d.inspectedSessions = make(map[SessionKey]bool)
 	}
 	if d.Artifacts.CacheRoot == "" {
 		d.Artifacts = NewArtifactWriter(d.Config.CacheRoot)
@@ -205,6 +212,9 @@ func (d *Daemon) handleOpenSSLEvent(event ebpf.OpenSSLEvent, tracked map[int]Pro
 	if !ok || event.SessionPtr == 0 {
 		return
 	}
+	if d.inspectedSessions == nil {
+		d.inspectedSessions = make(map[SessionKey]bool)
+	}
 	seenOpenSSL[int(event.PID)] = true
 	key := SessionKey{PID: int(event.PID), SSLPointer: event.SessionPtr}
 	update := SessionMetadataUpdate{
@@ -244,8 +254,10 @@ func (d *Daemon) handleOpenSSLEvent(event ebpf.OpenSSLEvent, tracked map[int]Pro
 		update.NegotiatedGroup = &negotiatedGroup
 	case ebpf.OpenSSLEventTypeHandshake:
 		if event.Value > 0 {
-			update.KeyStatus = KeyStatusUnavailable
-			update.KeyStatusNote = "key export not implemented"
+			if d.Inspector == nil {
+				update.KeyStatus = KeyStatusUnavailable
+				update.KeyStatusNote = "key export not implemented"
+			}
 		} else {
 			update.KeyStatus = KeyStatusPartial
 			update.KeyStatusNote = "handshake incomplete"
@@ -253,6 +265,30 @@ func (d *Daemon) handleOpenSSLEvent(event ebpf.OpenSSLEvent, tracked map[int]Pro
 	}
 
 	snapshot := d.Store.MergeMetadata(update)
+	if event.EventType == ebpf.OpenSSLEventTypeHandshake && event.Value > 0 && !d.inspectedSessions[key] && d.Inspector != nil {
+		d.inspectedSessions[key] = true
+		inspection, err := d.Inspector.Inspect(int(event.PID), event.SessionPtr)
+		if err != nil {
+			d.Store.MergeMetadata(SessionMetadataUpdate{
+				Key:           key,
+				ObservedAt:    time.Unix(0, int64(event.TimestampNS)),
+				KeyStatus:     KeyStatusUnavailable,
+				KeyStatusNote: fmt.Sprintf("openssl inspection failed: %v", err),
+			})
+		} else {
+			d.Store.MergeMetadata(SessionMetadataUpdate{
+				Key:           key,
+				ObservedAt:    time.Unix(0, int64(event.TimestampNS)),
+				TLSVersion:    inspection.TLSVersion,
+				CipherSuite:   inspection.CipherSuite,
+				ALPN:          inspection.ALPN,
+				Certificates:  inspection.Certificates,
+				KeyStatus:     inspection.KeyStatus,
+				KeyStatusNote: inspection.KeyStatusNote,
+				KeyLogLines:   inspection.KeyLogLines,
+			})
+		}
+	}
 	_ = snapshot
 }
 
@@ -330,6 +366,11 @@ func (d *Daemon) flushExited(
 		for key := range fdBySession {
 			if key.PID == pid {
 				delete(fdBySession, key)
+			}
+		}
+		for key := range d.inspectedSessions {
+			if key.PID == pid {
+				delete(d.inspectedSessions, key)
 			}
 		}
 	}

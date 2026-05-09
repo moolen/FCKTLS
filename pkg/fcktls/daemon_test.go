@@ -189,6 +189,67 @@ func TestDaemonFinalizesCaptureSession(t *testing.T) {
 	}
 }
 
+func TestDaemonUsesInspectorForNegotiatedMetadataAndKeys(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	var stdout bytes.Buffer
+	cfg, err := NewConfig("curl", false, t.TempDir())
+	if err != nil {
+		t.Fatalf("NewConfig() error = %v", err)
+	}
+
+	d := &Daemon{
+		Config:  cfg,
+		OpenSSL: &stubOpenSSLLoader{attachedPaths: []string{"/usr/lib/libssl.so.3"}},
+		Inspector: stubInspector{inspection: OpenSSLInspection{
+			TLSVersion:    "TLSv1.3",
+			CipherSuite:   "TLS_AES_128_GCM_SHA256",
+			ALPN:          "h2",
+			Certificates:  []CertificateSummary{{Subject: "/CN=example.com", Issuer: "/CN=Example CA"}},
+			KeyLogLines:   []string{"CLIENT_TRAFFIC_SECRET_0 abc def"},
+			KeyStatus:     KeyStatusAvailable,
+			KeyStatusNote: "openssl key log exported",
+		}},
+		Monitor: NewProcessMonitor("curl", staticExeResolver{
+			paths: map[int]string{404: "/usr/bin/curl"},
+		}),
+		Now:       func() time.Time { return now },
+		Stdout:    &stdout,
+		Artifacts: NewArtifactWriter(cfg.CacheRoot),
+		Store:     NewSessionStore(),
+	}
+	tracked := map[int]ProcessMatch{
+		404: {PID: 404, ExePath: "/usr/bin/curl", Basename: "curl"},
+	}
+	seen := map[int]bool{404: false}
+	fds := make(map[SessionKey]int)
+	exited := map[int]time.Time{404: now.Add(time.Second)}
+
+	d.handleOpenSSLEvent(ebpf.OpenSSLEvent{
+		PID:         404,
+		TimestampNS: uint64(now.UnixNano()),
+		SessionPtr:  0x4,
+		ProbeKind:   ebpf.OpenSSLProbeKindSSLConnect,
+		EventType:   ebpf.OpenSSLEventTypeHandshake,
+		Value:       1,
+	}, tracked, seen, fds)
+	d.flushExited(tracked, seen, fds, exited, time.Unix(1<<62, 0))
+
+	for _, want := range []string{"tls=TLSv1.3", "cipher=TLS_AES_128_GCM_SHA256", "alpn=h2", "certs=1", "key_status=available"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+		}
+	}
+
+	keysPath := filepath.Join(cfg.CacheRoot, "pid-404-ssl-0x4", "keys.log")
+	data, err := os.ReadFile(keysPath)
+	if err != nil {
+		t.Fatalf("ReadFile(keys.log) error = %v", err)
+	}
+	if !strings.Contains(string(data), "CLIENT_TRAFFIC_SECRET_0 abc def") {
+		t.Fatalf("keys.log = %q, want key log line", data)
+	}
+}
+
 func TestDaemonIgnoresUnmatchedExec(t *testing.T) {
 	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
 	procLoader := &stubProcessEventLoader{
@@ -252,6 +313,15 @@ type stubOpenSSLLoader struct {
 	attachedPaths []string
 	eventCh       chan ebpf.OpenSSLEvent
 	appDataCh     chan ebpf.OpenSSLAppDataEvent
+}
+
+type stubInspector struct {
+	inspection OpenSSLInspection
+	err        error
+}
+
+func (s stubInspector) Inspect(pid int, sslPtr uint64) (OpenSSLInspection, error) {
+	return s.inspection, s.err
 }
 
 func (s *stubOpenSSLLoader) AttachedLibraryPaths() []string {

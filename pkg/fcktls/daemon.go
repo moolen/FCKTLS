@@ -336,10 +336,11 @@ func (d *Daemon) emitUnsupportedRuntime(pid int, match ProcessMatch) {
 		KeyStatusNote: "matched process exited without OpenSSL events; unsupported runtime or no TLS activity",
 		CaptureMode:   d.Config.CaptureMode,
 	})
-	d.writeLine(RenderSessionSummary(snapshot))
 	if finalized, ok := d.Store.Finalize(SessionKey{PID: pid, SSLPointer: 0}, d.Now()); ok {
 		d.flushSnapshot(finalized)
+		return
 	}
+	d.writeLine(RenderSessionSummary(snapshot))
 }
 
 func (d *Daemon) flushExited(

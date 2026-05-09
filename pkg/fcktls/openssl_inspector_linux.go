@@ -101,6 +101,10 @@ func (i *openSSLRemoteInspector) Inspect(pid int, sslPtr uint64) (OpenSSLInspect
 		inspection.KeyLogLines = keyLogLines
 		inspection.KeyStatus = KeyStatusAvailable
 		inspection.KeyStatusNote = "openssl key log exported"
+	} else if strings.Contains(inspection.TLSVersion, "1.3") {
+		inspection.KeyStatusNote = "TLS 1.3 key export unavailable via OpenSSL public getters; requires keylog callback or deeper hooks"
+	} else {
+		inspection.KeyStatusNote = "key export unavailable"
 	}
 
 	return inspection, nil
@@ -262,7 +266,12 @@ func (p *remoteProcess) Call(function uintptr, scratchSize int, args ...uintptr)
 	}
 
 	patch := append([]byte(nil), p.trapCode...)
-	patch[0] = 0xcc
+	patch[0] = 0xff // call rax
+	patch[1] = 0xd0
+	patch[2] = 0xcc // int3 after return
+	for i := 3; i < len(patch); i++ {
+		patch[i] = 0x90
+	}
 	if _, err := unix.PtracePokeData(p.pid, p.trapAddr, patch); err != nil {
 		return 0, 0, fmt.Errorf("ptrace patch trap: %w", err)
 	}
@@ -271,14 +280,12 @@ func (p *remoteProcess) Call(function uintptr, scratchSize int, args ...uintptr)
 		_ = unix.PtraceSetRegs(p.pid, &p.savedRegs)
 	}()
 
-	scratchBase, returnAddrSlot := p.scratchLayout(scratchSize)
-	if err := p.writeUint64(returnAddrSlot, uint64(p.trapAddr)); err != nil {
-		return 0, 0, err
-	}
+	scratchBase, stackTop := p.scratchLayout(scratchSize)
 
 	regs := p.savedRegs
-	regs.Rip = uint64(function)
-	regs.Rsp = uint64(returnAddrSlot)
+	regs.Rip = uint64(p.trapAddr)
+	regs.Rax = uint64(function)
+	regs.Rsp = uint64(stackTop)
 	if len(args) > 0 {
 		regs.Rdi = uint64(args[0])
 	}
@@ -317,9 +324,8 @@ func (p *remoteProcess) Call(function uintptr, scratchSize int, args ...uintptr)
 func (p *remoteProcess) scratchLayout(scratchSize int) (uintptr, uintptr) {
 	scratchSize = alignUp(maxInt(scratchSize, remoteStackReserve), 16)
 	stackTop := alignDown(uintptr(p.savedRegs.Rsp)-0x200, 16)
-	returnAddrSlot := stackTop - 8
-	scratchBase := alignDown(returnAddrSlot-uintptr(scratchSize), 16)
-	return scratchBase, returnAddrSlot
+	scratchBase := alignDown(stackTop-uintptr(scratchSize), 16)
+	return scratchBase, stackTop
 }
 
 func waitForStop(pid int) error {

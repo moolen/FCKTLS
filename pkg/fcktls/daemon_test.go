@@ -295,6 +295,37 @@ func TestDaemonIgnoresUnmatchedExec(t *testing.T) {
 	}
 }
 
+func TestDaemonUnsupportedRuntimePrintsSingleSummary(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	var stdout bytes.Buffer
+	cfg, err := NewConfig("curl", false, t.TempDir())
+	if err != nil {
+		t.Fatalf("NewConfig() error = %v", err)
+	}
+
+	d := &Daemon{
+		Config:  cfg,
+		OpenSSL: &stubOpenSSLLoader{attachedPaths: []string{"/usr/lib/libssl.so.3"}},
+		Monitor: NewProcessMonitor("curl", staticExeResolver{
+			paths: map[int]string{505: "/usr/bin/curl"},
+		}),
+		Now:       func() time.Time { return now },
+		Stdout:    &stdout,
+		Artifacts: NewArtifactWriter(cfg.CacheRoot),
+		Store:     NewSessionStore(),
+	}
+	match := ProcessMatch{PID: 505, ExePath: "/usr/bin/curl", Basename: "curl"}
+
+	d.emitUnsupportedRuntime(505, match)
+
+	if got, want := strings.Count(stdout.String(), "session pid-505-ssl-0x0"), 1; got != want {
+		t.Fatalf("session header count = %d, want %d (%q)", got, want, stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "pid=505") {
+		t.Fatalf("stdout = %q, want pid", stdout.String())
+	}
+}
+
 type stubProcessEventLoader struct {
 	ch chan ebpf.ProcessEvent
 }

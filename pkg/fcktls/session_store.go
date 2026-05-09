@@ -121,8 +121,26 @@ func (r *sessionRecord) mergeMetadata(update SessionMetadataUpdate) {
 	if update.Role != "" {
 		r.metadata.Role = update.Role
 	}
+	if update.SocketFD != nil {
+		r.metadata.SocketFD = cloneInt(update.SocketFD)
+	}
 	if update.SNI != "" {
 		r.metadata.SNI = update.SNI
+	}
+	if update.Groups != "" {
+		r.metadata.Groups = update.Groups
+	}
+	if update.VerifyMode != nil {
+		r.metadata.VerifyMode = cloneInt(update.VerifyMode)
+	}
+	if update.SessionReused != nil {
+		r.metadata.SessionReused = cloneBool(update.SessionReused)
+	}
+	if update.VerifyResult != nil {
+		r.metadata.VerifyResult = cloneInt(update.VerifyResult)
+	}
+	if update.NegotiatedGroup != nil {
+		r.metadata.NegotiatedGroup = cloneInt(update.NegotiatedGroup)
 	}
 	if update.TLSVersion != "" {
 		r.metadata.TLSVersion = update.TLSVersion
@@ -162,25 +180,31 @@ func (r *sessionRecord) touch(observedAt time.Time) {
 func (r *sessionRecord) snapshot(finalizedAt time.Time) SessionSnapshot {
 	return SessionSnapshot{
 		Metadata: SessionMetadata{
-			SessionID:     r.metadata.SessionID,
-			Key:           r.metadata.Key,
-			PID:           r.metadata.PID,
-			ExePath:       r.metadata.ExePath,
-			LibraryPath:   r.metadata.LibraryPath,
-			Source:        r.metadata.Source,
-			Destination:   r.metadata.Destination,
-			Role:          r.metadata.Role,
-			SNI:           r.metadata.SNI,
-			TLSVersion:    r.metadata.TLSVersion,
-			CipherSuite:   r.metadata.CipherSuite,
-			ALPN:          r.metadata.ALPN,
-			Certificates:  append([]CertificateSummary(nil), r.metadata.Certificates...),
-			KeyStatus:     r.metadata.KeyStatus,
-			KeyStatusNote: r.metadata.KeyStatusNote,
-			KeyLogLines:   append([]string(nil), r.metadata.KeyLogLines...),
-			CaptureMode:   r.metadata.CaptureMode,
-			FirstSeen:     r.metadata.FirstSeen,
-			LastSeen:      r.metadata.LastSeen,
+			SessionID:       r.metadata.SessionID,
+			Key:             r.metadata.Key,
+			PID:             r.metadata.PID,
+			ExePath:         r.metadata.ExePath,
+			LibraryPath:     r.metadata.LibraryPath,
+			Source:          r.metadata.Source,
+			Destination:     r.metadata.Destination,
+			Role:            r.metadata.Role,
+			SocketFD:        cloneInt(r.metadata.SocketFD),
+			SNI:             r.metadata.SNI,
+			Groups:          r.metadata.Groups,
+			VerifyMode:      cloneInt(r.metadata.VerifyMode),
+			SessionReused:   cloneBool(r.metadata.SessionReused),
+			VerifyResult:    cloneInt(r.metadata.VerifyResult),
+			NegotiatedGroup: cloneInt(r.metadata.NegotiatedGroup),
+			TLSVersion:      r.metadata.TLSVersion,
+			CipherSuite:     r.metadata.CipherSuite,
+			ALPN:            r.metadata.ALPN,
+			Certificates:    append([]CertificateSummary(nil), r.metadata.Certificates...),
+			KeyStatus:       r.metadata.KeyStatus,
+			KeyStatusNote:   r.metadata.KeyStatusNote,
+			KeyLogLines:     append([]string(nil), r.metadata.KeyLogLines...),
+			CaptureMode:     r.metadata.CaptureMode,
+			FirstSeen:       r.metadata.FirstSeen,
+			LastSeen:        r.metadata.LastSeen,
 		},
 		Streams: PlaintextStreams{
 			ClientToServer: append([]byte(nil), r.streams.ClientToServer...),
@@ -222,4 +246,20 @@ func appendUniqueCertificates(existing []CertificateSummary, values []Certificat
 	}
 
 	return existing
+}
+
+func cloneInt(value *int) *int {
+	if value == nil {
+		return nil
+	}
+	out := *value
+	return &out
+}
+
+func cloneBool(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	out := *value
+	return &out
 }

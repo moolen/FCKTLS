@@ -43,3 +43,47 @@ func TestRenderCaptureOutput(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderSessionSummaryIncludesObservedOpenSSLEventMetadataOnly(t *testing.T) {
+	reused := false
+	verifyResult := 0
+	negotiatedGroup := 1034
+	out := RenderSessionSummary(SessionSnapshot{
+		Metadata: SessionMetadata{
+			SessionID:       "pid-12-ssl-0xc",
+			PID:             12,
+			ExePath:         "/usr/bin/curl",
+			SocketFD:        intPtr(17),
+			SNI:             "example.com",
+			Groups:          "X25519:P-256",
+			VerifyMode:      intPtr(1),
+			SessionReused:   &reused,
+			VerifyResult:    &verifyResult,
+			NegotiatedGroup: &negotiatedGroup,
+			KeyStatus:       KeyStatusUnavailable,
+			CaptureMode:     CaptureModeMetadataOnly,
+		},
+	})
+
+	for _, want := range []string{
+		"fd=17",
+		"sni=example.com",
+		"groups=X25519:P-256",
+		"verify_mode=1",
+		"session_reused=false",
+		"verify_result=0",
+		"negotiated_group=1034",
+		"key_status=unavailable",
+		"capture=metadata",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("summary missing %q in %q", want, out)
+		}
+	}
+
+	for _, unwanted := range []string{"tls=", "cipher=", "alpn=", "certs="} {
+		if strings.Contains(out, unwanted) {
+			t.Fatalf("summary unexpectedly contains %q in %q", unwanted, out)
+		}
+	}
+}

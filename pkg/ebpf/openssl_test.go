@@ -50,6 +50,49 @@ func TestDecodeOpenSSLEvent(t *testing.T) {
 	if got := string(event.SNIBytes[:11]); got != "example.com" {
 		t.Fatalf("SNIBytes = %q, want %q", got, "example.com")
 	}
+	if got := event.StringPayload(); got != "" {
+		t.Fatalf("StringPayload = %q, want empty string", got)
+	}
+}
+
+func TestDecodeOpenSSLEventStringPayload(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		eventType OpenSSLEventType
+		payload   string
+	}{
+		{
+			name:      "set sni",
+			eventType: OpenSSLEventTypeSetSNI,
+			payload:   "example.com",
+		},
+		{
+			name:      "set groups",
+			eventType: OpenSSLEventTypeSetGroups,
+			payload:   "X25519:P-256",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			raw := make([]byte, openSSLEventSize)
+			raw[37] = byte(tt.eventType)
+			copy(raw[40:104], tt.payload)
+
+			event, err := decodeOpenSSLEvent(raw)
+			if err != nil {
+				t.Fatalf("decodeOpenSSLEvent returned error: %v", err)
+			}
+			if got := event.StringPayload(); got != tt.payload {
+				t.Fatalf("StringPayload = %q, want %q", got, tt.payload)
+			}
+		})
+	}
 }
 
 func TestDecodeOpenSSLAppDataEvent(t *testing.T) {

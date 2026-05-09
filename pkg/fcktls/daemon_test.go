@@ -3,6 +3,7 @@ package fcktls
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,8 +44,45 @@ func TestDaemonFinalizesMatchedMetadataSession(t *testing.T) {
 		PID:        101,
 		SessionPtr: 0x1,
 		ProbeKind:  ebpf.OpenSSLProbeKindSSLConnect,
+		EventType:  ebpf.OpenSSLEventTypeSetFD,
+		Value:      9,
+	}, tracked, seen, fds)
+	d.handleOpenSSLEvent(ebpf.OpenSSLEvent{
+		PID:        101,
+		SessionPtr: 0x1,
+		ProbeKind:  ebpf.OpenSSLProbeKindSSLConnect,
 		EventType:  ebpf.OpenSSLEventTypeSetSNI,
 		SNIBytes:   toSNIBytes("example.com"),
+	}, tracked, seen, fds)
+	d.handleOpenSSLEvent(ebpf.OpenSSLEvent{
+		PID:        101,
+		SessionPtr: 0x1,
+		EventType:  ebpf.OpenSSLEventTypeSetGroups,
+		SNIBytes:   toSNIBytes("X25519:P-256"),
+	}, tracked, seen, fds)
+	d.handleOpenSSLEvent(ebpf.OpenSSLEvent{
+		PID:        101,
+		SessionPtr: 0x1,
+		EventType:  ebpf.OpenSSLEventTypeSetVerify,
+		Value:      3,
+	}, tracked, seen, fds)
+	d.handleOpenSSLEvent(ebpf.OpenSSLEvent{
+		PID:        101,
+		SessionPtr: 0x1,
+		EventType:  ebpf.OpenSSLEventTypeSessionReused,
+		Value:      0,
+	}, tracked, seen, fds)
+	d.handleOpenSSLEvent(ebpf.OpenSSLEvent{
+		PID:        101,
+		SessionPtr: 0x1,
+		EventType:  ebpf.OpenSSLEventTypeVerifyResult,
+		Value:      0,
+	}, tracked, seen, fds)
+	d.handleOpenSSLEvent(ebpf.OpenSSLEvent{
+		PID:        101,
+		SessionPtr: 0x1,
+		EventType:  ebpf.OpenSSLEventTypeNegotiatedGroup,
+		Value:      1034,
 	}, tracked, seen, fds)
 	d.handleOpenSSLEvent(ebpf.OpenSSLEvent{
 		PID:        101,
@@ -55,12 +93,53 @@ func TestDaemonFinalizesMatchedMetadataSession(t *testing.T) {
 	}, tracked, seen, fds)
 	d.flushExited(tracked, seen, fds, exited, time.Unix(1<<62, 0))
 
-	if !strings.Contains(stdout.String(), "example.com") {
-		t.Fatalf("stdout = %q, want SNI", stdout.String())
+	for _, want := range []string{
+		"example.com",
+		"fd=9",
+		"groups=X25519:P-256",
+		"verify_mode=3",
+		"session_reused=false",
+		"verify_result=0",
+		"negotiated_group=1034",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+		}
 	}
 	summaryPath := filepath.Join(cfg.CacheRoot, "pid-101-ssl-0x1", "summary.json")
 	if _, err := os.Stat(summaryPath); err != nil {
 		t.Fatalf("summary.json stat error = %v", err)
+	}
+
+	rawSummary, err := os.ReadFile(summaryPath)
+	if err != nil {
+		t.Fatalf("ReadFile(summary.json) error = %v", err)
+	}
+
+	var summary struct {
+		Metadata SessionMetadata `json:"metadata"`
+	}
+	if err := json.Unmarshal(rawSummary, &summary); err != nil {
+		t.Fatalf("Unmarshal(summary.json) error = %v", err)
+	}
+
+	if summary.Metadata.SocketFD == nil || *summary.Metadata.SocketFD != 9 {
+		t.Fatalf("socket_fd = %v, want 9", summary.Metadata.SocketFD)
+	}
+	if got, want := summary.Metadata.Groups, "X25519:P-256"; got != want {
+		t.Fatalf("groups = %q, want %q", got, want)
+	}
+	if summary.Metadata.VerifyMode == nil || *summary.Metadata.VerifyMode != 3 {
+		t.Fatalf("verify_mode = %v, want 3", summary.Metadata.VerifyMode)
+	}
+	if summary.Metadata.SessionReused == nil || *summary.Metadata.SessionReused {
+		t.Fatalf("session_reused = %v, want false", summary.Metadata.SessionReused)
+	}
+	if summary.Metadata.VerifyResult == nil || *summary.Metadata.VerifyResult != 0 {
+		t.Fatalf("verify_result = %v, want 0", summary.Metadata.VerifyResult)
+	}
+	if summary.Metadata.NegotiatedGroup == nil || *summary.Metadata.NegotiatedGroup != 1034 {
+		t.Fatalf("negotiated_group = %v, want 1034", summary.Metadata.NegotiatedGroup)
 	}
 }
 

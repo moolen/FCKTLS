@@ -1,7 +1,6 @@
 package fcktls
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -220,13 +219,29 @@ func (d *Daemon) handleOpenSSLEvent(event ebpf.OpenSSLEvent, tracked map[int]Pro
 
 	switch event.EventType {
 	case ebpf.OpenSSLEventTypeSetSNI:
-		update.SNI = decodeInlineSNI(event.SNIBytes)
+		update.SNI = event.StringPayload()
 	case ebpf.OpenSSLEventTypeSetFD:
+		fd := int(event.Value)
+		update.SocketFD = &fd
 		fdBySession[key] = int(event.Value)
 		if local, peer, ok, err := resolveSocketTuple(int(event.PID), int(event.Value)); err == nil && ok {
 			update.Source = &local
 			update.Destination = &peer
 		}
+	case ebpf.OpenSSLEventTypeSetGroups:
+		update.Groups = event.StringPayload()
+	case ebpf.OpenSSLEventTypeSetVerify:
+		verifyMode := int(event.Value)
+		update.VerifyMode = &verifyMode
+	case ebpf.OpenSSLEventTypeSessionReused:
+		reused := event.Value > 0
+		update.SessionReused = &reused
+	case ebpf.OpenSSLEventTypeVerifyResult:
+		verifyResult := int(event.Value)
+		update.VerifyResult = &verifyResult
+	case ebpf.OpenSSLEventTypeNegotiatedGroup:
+		negotiatedGroup := int(event.Value)
+		update.NegotiatedGroup = &negotiatedGroup
 	case ebpf.OpenSSLEventTypeHandshake:
 		if event.Value > 0 {
 			update.KeyStatus = KeyStatusUnavailable
@@ -339,14 +354,6 @@ func roleFromProbeKind(kind ebpf.OpenSSLProbeKind) string {
 	default:
 		return "unknown"
 	}
-}
-
-func decodeInlineSNI(raw [64]byte) string {
-	buf := raw[:]
-	if idx := bytes.IndexByte(buf, 0); idx >= 0 {
-		buf = buf[:idx]
-	}
-	return strings.TrimSpace(string(buf))
 }
 
 func firstAttachedLibraryPath(loader openSSLReader) string {

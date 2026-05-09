@@ -119,7 +119,8 @@ type OpenSSLEvent struct {
 	ProbeKind   OpenSSLProbeKind
 	EventType   OpenSSLEventType
 	_           [2]byte
-	SNIBytes    [64]byte
+	// SNIBytes carries inline string payloads for string-like events such as SNI and groups.
+	SNIBytes [64]byte
 }
 
 type OpenSSLAppDataEvent struct {
@@ -140,6 +141,19 @@ type OpenSSLLoader struct {
 	appDataReader *ringbuf.Reader
 	mu            sync.Mutex
 	attachments   map[string][]link.Link
+}
+
+func (e OpenSSLEvent) StringPayload() string {
+	switch e.EventType {
+	case OpenSSLEventTypeSetSNI, OpenSSLEventTypeSetGroups:
+		end := bytes.IndexByte(e.SNIBytes[:], 0)
+		if end == -1 {
+			end = len(e.SNIBytes)
+		}
+		return string(e.SNIBytes[:end])
+	default:
+		return ""
+	}
 }
 
 type openSSLObjects struct {

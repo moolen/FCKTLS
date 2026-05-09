@@ -178,11 +178,12 @@ static __always_inline int submit_openssl_event(__u8 event_type, __u8 probe_kind
 	event->value = value;
 	event->probe_kind = probe_kind;
 	event->event_type = event_type;
+	__builtin_memset(event->sni, 0, sizeof(event->sni));
 	bpf_ringbuf_submit(event, 0);
 	return 0;
 }
 
-static __always_inline int submit_openssl_sni_event(__u64 session_ptr, const struct openssl_sni_pending *pending)
+static __always_inline int submit_openssl_string_event(__u8 event_type, __u64 session_ptr, const char value[OPENSSL_SNI_MAX_LEN])
 {
 	__u32 pid = 0;
 	__u32 tid = 0;
@@ -199,10 +200,16 @@ static __always_inline int submit_openssl_sni_event(__u64 session_ptr, const str
 	event->data_ptr = 0;
 	event->value = 0;
 	event->probe_kind = OPENSSL_PROBE_KIND_UNKNOWN;
-	event->event_type = OPENSSL_EVENT_TYPE_SET_SNI;
-	__builtin_memcpy(event->sni, pending->name, sizeof(event->sni));
+	event->event_type = event_type;
+	__builtin_memset(event->sni, 0, sizeof(event->sni));
+	__builtin_memcpy(event->sni, value, sizeof(event->sni));
 	bpf_ringbuf_submit(event, 0);
 	return 0;
+}
+
+static __always_inline int submit_openssl_sni_event(__u64 session_ptr, const struct openssl_sni_pending *pending)
+{
+	return submit_openssl_string_event(OPENSSL_EVENT_TYPE_SET_SNI, session_ptr, pending->name);
 }
 
 static __always_inline int submit_openssl_app_data_event(const struct openssl_app_data_pending *pending, __s32 rc)
@@ -375,7 +382,7 @@ int openssl_ssl_set_groups_list_return(struct pt_regs *ctx)
 		return 0;
 	}
 	if ((__s32)PT_REGS_RC(ctx) > 0) {
-		submit_openssl_event(OPENSSL_EVENT_TYPE_SET_GROUPS, OPENSSL_PROBE_KIND_UNKNOWN, pending->session_ptr, 0, (__u64)pending->groups);
+		submit_openssl_string_event(OPENSSL_EVENT_TYPE_SET_GROUPS, pending->session_ptr, pending->groups);
 	}
 	bpf_map_delete_elem(&openssl_groups_pending, &pid_tgid);
 	return 0;

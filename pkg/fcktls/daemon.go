@@ -37,8 +37,10 @@ type Daemon struct {
 	Stdout        io.Writer
 	Artifacts     ArtifactWriter
 	Store         *SessionStore
+	OnReady       func()
 
 	inspectedSessions map[SessionKey]bool
+	inspectAttempts   map[SessionKey]int
 }
 
 func NewDaemon(cfg Config) (*Daemon, error) {
@@ -85,6 +87,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if d.inspectedSessions == nil {
 		d.inspectedSessions = make(map[SessionKey]bool)
 	}
+	if d.inspectAttempts == nil {
+		d.inspectAttempts = make(map[SessionKey]int)
+	}
 	if d.Artifacts.CacheRoot == "" {
 		d.Artifacts = NewArtifactWriter(d.Config.CacheRoot)
 	}
@@ -124,6 +129,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		go pumpOpenSSLAppDataEvents(d.OpenSSL, appCh, errCh)
 	} else {
 		close(appCh)
+	}
+	if d.OnReady != nil {
+		d.OnReady()
 	}
 
 	ticker := time.NewTicker(5 * time.Second)
@@ -265,29 +273,8 @@ func (d *Daemon) handleOpenSSLEvent(event ebpf.OpenSSLEvent, tracked map[int]Pro
 	}
 
 	snapshot := d.Store.MergeMetadata(update)
-	if event.EventType == ebpf.OpenSSLEventTypeHandshake && event.Value > 0 && !d.inspectedSessions[key] && d.Inspector != nil {
-		d.inspectedSessions[key] = true
-		inspection, err := d.Inspector.Inspect(int(event.PID), event.SessionPtr)
-		if err != nil {
-			d.Store.MergeMetadata(SessionMetadataUpdate{
-				Key:           key,
-				ObservedAt:    time.Unix(0, int64(event.TimestampNS)),
-				KeyStatus:     KeyStatusUnavailable,
-				KeyStatusNote: fmt.Sprintf("openssl inspection failed: %v", err),
-			})
-		} else {
-			d.Store.MergeMetadata(SessionMetadataUpdate{
-				Key:           key,
-				ObservedAt:    time.Unix(0, int64(event.TimestampNS)),
-				TLSVersion:    inspection.TLSVersion,
-				CipherSuite:   inspection.CipherSuite,
-				ALPN:          inspection.ALPN,
-				Certificates:  inspection.Certificates,
-				KeyStatus:     inspection.KeyStatus,
-				KeyStatusNote: inspection.KeyStatusNote,
-				KeyLogLines:   inspection.KeyLogLines,
-			})
-		}
+	if d.shouldInspectOpenSSLEvent(event) {
+		d.inspectOpenSSLSession(key, int(event.PID), event.SessionPtr, time.Unix(0, int64(event.TimestampNS)))
 	}
 	_ = snapshot
 }
@@ -296,6 +283,12 @@ func (d *Daemon) handleAppDataEvent(event ebpf.OpenSSLAppDataEvent, tracked map[
 	if _, ok := tracked[int(event.PID)]; !ok || event.SessionPtr == 0 {
 		return
 	}
+	d.inspectOpenSSLSession(
+		SessionKey{PID: int(event.PID), SSLPointer: event.SessionPtr},
+		int(event.PID),
+		event.SessionPtr,
+		time.Unix(0, int64(event.TimestampNS)),
+	)
 
 	direction := StreamDirectionClientToServer
 	if event.Direction == ebpf.OpenSSLAppDataDirectionRead {
@@ -311,6 +304,97 @@ func (d *Daemon) handleAppDataEvent(event ebpf.OpenSSLAppDataEvent, tracked map[
 		Data:       append([]byte(nil), event.Payload[:event.PayloadLength]...),
 	})
 	_ = snapshot
+}
+
+func (d *Daemon) shouldInspectOpenSSLEvent(event ebpf.OpenSSLEvent) bool {
+	if d == nil || d.Inspector == nil {
+		return false
+	}
+	switch event.EventType {
+	case ebpf.OpenSSLEventTypeHandshake:
+		return event.Value > 0
+	case ebpf.OpenSSLEventTypeVerifyResult, ebpf.OpenSSLEventTypeSessionReused, ebpf.OpenSSLEventTypeNegotiatedGroup:
+		return true
+	default:
+		return false
+	}
+}
+
+func (d *Daemon) inspectOpenSSLSession(key SessionKey, pid int, sslPtr uint64, observedAt time.Time) {
+	if d == nil || d.Inspector == nil || sslPtr == 0 {
+		return
+	}
+	if d.inspectedSessions == nil {
+		d.inspectedSessions = make(map[SessionKey]bool)
+	}
+	if d.inspectAttempts == nil {
+		d.inspectAttempts = make(map[SessionKey]int)
+	}
+	if d.inspectedSessions[key] {
+		return
+	}
+	if d.inspectAttempts[key] >= 3 {
+		return
+	}
+	d.inspectAttempts[key]++
+
+	inspection, err := d.Inspector.Inspect(pid, sslPtr)
+	if err != nil {
+		d.Store.MergeMetadata(SessionMetadataUpdate{
+			Key:           key,
+			ObservedAt:    observedAt,
+			KeyStatus:     KeyStatusUnavailable,
+			KeyStatusNote: fmt.Sprintf("openssl inspection failed: %v", err),
+		})
+		return
+	}
+
+	if inspectionComplete(inspection) {
+		d.inspectedSessions[key] = true
+	}
+	d.Store.MergeMetadata(SessionMetadataUpdate{
+		Key:           key,
+		ObservedAt:    observedAt,
+		TLSVersion:    inspection.TLSVersion,
+		CipherSuite:   inspection.CipherSuite,
+		ALPN:          inspection.ALPN,
+		Certificates:  inspection.Certificates,
+		KeyStatus:     inspection.KeyStatus,
+		KeyStatusNote: inspection.KeyStatusNote,
+		KeyLogLines:   inspection.KeyLogLines,
+	})
+}
+
+func inspectionUseful(inspection OpenSSLInspection) bool {
+	if len(inspection.KeyLogLines) > 0 {
+		return true
+	}
+	if tlsVersion := strings.TrimSpace(inspection.TLSVersion); tlsVersion != "" && !strings.EqualFold(tlsVersion, "unknown") {
+		return true
+	}
+	if strings.TrimSpace(inspection.CipherSuite) != "" {
+		return true
+	}
+	if strings.TrimSpace(inspection.ALPN) != "" {
+		return true
+	}
+	return len(inspection.Certificates) > 0
+}
+
+func inspectionComplete(inspection OpenSSLInspection) bool {
+	if !inspectionUseful(inspection) {
+		return false
+	}
+	if len(inspection.KeyLogLines) > 0 {
+		return true
+	}
+
+	tlsVersion := strings.TrimSpace(inspection.TLSVersion)
+	if strings.Contains(tlsVersion, "1.3") {
+		return true
+	}
+
+	return false
 }
 
 func (d *Daemon) flushSnapshot(snapshot SessionSnapshot) {
@@ -372,6 +456,11 @@ func (d *Daemon) flushExited(
 		for key := range d.inspectedSessions {
 			if key.PID == pid {
 				delete(d.inspectedSessions, key)
+			}
+		}
+		for key := range d.inspectAttempts {
+			if key.PID == pid {
+				delete(d.inspectAttempts, key)
 			}
 		}
 	}

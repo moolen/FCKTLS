@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -61,6 +62,8 @@ func (i *openSSLRemoteInspector) Inspect(pid int, sslPtr uint64) (OpenSSLInspect
 	if pid <= 0 || sslPtr == 0 {
 		return OpenSSLInspection{}, nil
 	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 
 	resolver, err := newRemoteSymbolResolver(pid)
 	if err != nil {

@@ -21,6 +21,7 @@ enum openssl_event_type {
 	OPENSSL_EVENT_TYPE_SESSION_REUSED = 6,
 	OPENSSL_EVENT_TYPE_VERIFY_RESULT = 7,
 	OPENSSL_EVENT_TYPE_NEGOTIATED_GROUP = 8,
+	OPENSSL_EVENT_TYPE_KEY_MATERIAL = 9,
 };
 
 enum openssl_app_data_direction {
@@ -30,7 +31,10 @@ enum openssl_app_data_direction {
 };
 
 #define OPENSSL_SNI_MAX_LEN 64
+#define OPENSSL_CLIENT_RANDOM_LEN 32
+#define OPENSSL_SECRET_MAX_LEN 64
 #define OPENSSL_APP_DATA_MAX_LEN 512
+#define OPENSSL_KEYLOG_HELPER_CLIENT_RANDOM_OFFSET 0x160
 
 struct openssl_event {
 	__u64 timestamp_ns;
@@ -41,8 +45,11 @@ struct openssl_event {
 	__s32 value;
 	__u8 probe_kind;
 	__u8 event_type;
-	__u8 _pad[2];
+	__u8 client_random_length;
+	__u8 secret_length;
 	char sni[OPENSSL_SNI_MAX_LEN];
+	unsigned char client_random[OPENSSL_CLIENT_RANDOM_LEN];
+	unsigned char secret[OPENSSL_SECRET_MAX_LEN];
 };
 
 struct openssl_app_data_event {
@@ -207,6 +214,40 @@ static __always_inline int submit_openssl_string_event(__u8 event_type, __u64 se
 	return 0;
 }
 
+static __always_inline int submit_openssl_key_material_event(__u64 session_ptr, const char *label_ptr, const unsigned char *secret_ptr, __u64 secret_len)
+{
+	__u32 pid = 0;
+	__u32 tid = 0;
+	__u8 capped_secret_len = secret_len > OPENSSL_SECRET_MAX_LEN ? OPENSSL_SECRET_MAX_LEN : (__u8)secret_len;
+	current_pid_tgid(&pid, &tid);
+
+	struct openssl_event *event = bpf_ringbuf_reserve(&openssl_events, sizeof(*event), 0);
+	if (!event) {
+		return 0;
+	}
+
+	event->timestamp_ns = bpf_ktime_get_ns();
+	event->pid = pid;
+	event->tid = tid;
+	event->session_ptr = session_ptr;
+	event->data_ptr = 0;
+	event->value = 0;
+	event->probe_kind = OPENSSL_PROBE_KIND_UNKNOWN;
+	event->event_type = OPENSSL_EVENT_TYPE_KEY_MATERIAL;
+	event->client_random_length = OPENSSL_CLIENT_RANDOM_LEN;
+	event->secret_length = capped_secret_len;
+	__builtin_memset(event->sni, 0, sizeof(event->sni));
+	__builtin_memset(event->client_random, 0, sizeof(event->client_random));
+	__builtin_memset(event->secret, 0, sizeof(event->secret));
+	bpf_probe_read_user_str(event->sni, OPENSSL_CLIENT_RANDOM_LEN, label_ptr);
+	bpf_probe_read_user(event->client_random, OPENSSL_CLIENT_RANDOM_LEN, (void *)(session_ptr + OPENSSL_KEYLOG_HELPER_CLIENT_RANDOM_OFFSET));
+	if (capped_secret_len > 0) {
+		bpf_probe_read_user(event->secret, capped_secret_len, secret_ptr);
+	}
+	bpf_ringbuf_submit(event, 0);
+	return 0;
+}
+
 static __always_inline int submit_openssl_sni_event(__u64 session_ptr, const struct openssl_sni_pending *pending)
 {
 	return submit_openssl_string_event(OPENSSL_EVENT_TYPE_SET_SNI, session_ptr, pending->name);
@@ -303,6 +344,19 @@ SEC("uretprobe/SSL_do_handshake")
 int openssl_ssl_do_handshake_return(struct pt_regs *ctx)
 {
 	return openssl_return(ctx, OPENSSL_PROBE_KIND_SSL_DO_HANDSHAKE);
+}
+
+SEC("uprobe/openssl_keylog_secret")
+int openssl_ssl_keylog_secret_enter(struct pt_regs *ctx)
+{
+	__u64 session_ptr = PT_REGS_PARM1(ctx);
+	const char *label_ptr = (const char *)PT_REGS_PARM2(ctx);
+	const unsigned char *secret_ptr = (const unsigned char *)PT_REGS_PARM3(ctx);
+	__u64 secret_len = PT_REGS_PARM4(ctx);
+	if (session_ptr == 0 || label_ptr == 0 || secret_ptr == 0 || secret_len == 0) {
+		return 0;
+	}
+	return submit_openssl_key_material_event(session_ptr, label_ptr, secret_ptr, secret_len);
 }
 
 SEC("uprobe/SSL_set_fd")

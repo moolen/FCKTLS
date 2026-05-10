@@ -59,6 +59,7 @@ const (
 	OpenSSLEventTypeSessionReused
 	OpenSSLEventTypeVerifyResult
 	OpenSSLEventTypeNegotiatedGroup
+	OpenSSLEventTypeKeyMaterial
 )
 
 func (t OpenSSLEventType) String() string {
@@ -79,6 +80,8 @@ func (t OpenSSLEventType) String() string {
 		return "verify_result"
 	case OpenSSLEventTypeNegotiatedGroup:
 		return "negotiated_group"
+	case OpenSSLEventTypeKeyMaterial:
+		return "key_material"
 	default:
 		return "unknown"
 	}
@@ -104,23 +107,29 @@ func (d OpenSSLAppDataDirection) String() string {
 }
 
 const (
-	openSSLEventSize        = 104
+	openSSLEventSize        = 200
 	openSSLMaxPayload       = 512
 	openSSLAppDataEventSize = 32 + 1 + 3 + openSSLMaxPayload
+	// OpenSSL 3.x contains an internal helper immediately after SSL_CTX_get_keylog_callback
+	// that receives (SSL*, label, secret*, secret_len) before formatting NSS keylog lines.
+	openSSLKeylogSecretHelperOffset = 0xa0
 )
 
 type OpenSSLEvent struct {
-	TimestampNS uint64
-	PID         uint32
-	TID         uint32
-	SessionPtr  uint64
-	DataPtr     uint64
-	Value       int32
-	ProbeKind   OpenSSLProbeKind
-	EventType   OpenSSLEventType
-	_           [2]byte
+	TimestampNS        uint64
+	PID                uint32
+	TID                uint32
+	SessionPtr         uint64
+	DataPtr            uint64
+	Value              int32
+	ProbeKind          OpenSSLProbeKind
+	EventType          OpenSSLEventType
+	ClientRandomLength uint8
+	SecretLength       uint8
 	// SNIBytes carries inline string payloads for string-like events such as SNI and groups.
-	SNIBytes [64]byte
+	SNIBytes     [64]byte
+	ClientRandom [32]byte
+	Secret       [64]byte
 }
 
 type OpenSSLAppDataEvent struct {
@@ -145,7 +154,7 @@ type OpenSSLLoader struct {
 
 func (e OpenSSLEvent) StringPayload() string {
 	switch e.EventType {
-	case OpenSSLEventTypeSetSNI, OpenSSLEventTypeSetGroups:
+	case OpenSSLEventTypeSetSNI, OpenSSLEventTypeSetGroups, OpenSSLEventTypeKeyMaterial:
 		end := bytes.IndexByte(e.SNIBytes[:], 0)
 		if end == -1 {
 			end = len(e.SNIBytes)
@@ -176,6 +185,7 @@ type openSSLObjects struct {
 	SSLGetVerifyResultReturn    *cebpf.Program `ebpf:"openssl_ssl_get_verify_result_return"`
 	SSLGetNegotiatedGroupEnter  *cebpf.Program `ebpf:"openssl_ssl_get_negotiated_group_enter"`
 	SSLGetNegotiatedGroupReturn *cebpf.Program `ebpf:"openssl_ssl_get_negotiated_group_return"`
+	SSLKeylogSecretEnter        *cebpf.Program `ebpf:"openssl_ssl_keylog_secret_enter"`
 	SSLReadEnter                *cebpf.Program `ebpf:"openssl_ssl_read_enter"`
 	SSLReadReturn               *cebpf.Program `ebpf:"openssl_ssl_read_return"`
 	SSLWriteEnter               *cebpf.Program `ebpf:"openssl_ssl_write_enter"`
@@ -361,6 +371,7 @@ func (o openSSLObjects) Close() error {
 		o.SSLGetVerifyResultReturn,
 		o.SSLGetNegotiatedGroupEnter,
 		o.SSLGetNegotiatedGroupReturn,
+		o.SSLKeylogSecretEnter,
 		o.SSLReadEnter,
 		o.SSLReadReturn,
 		o.SSLWriteEnter,
@@ -401,6 +412,7 @@ func openSSLUprobeAttachSpecs(objects openSSLObjects) []uprobeAttachSpec {
 		{symbol: "SSL_session_reused", enter: objects.SSLSessionReusedEnter, ret: objects.SSLSessionReusedReturn, optional: true},
 		{symbol: "SSL_get_verify_result", enter: objects.SSLGetVerifyResultEnter, ret: objects.SSLGetVerifyResultReturn, optional: true},
 		{symbol: "SSL_get_negotiated_group", enter: objects.SSLGetNegotiatedGroupEnter, ret: objects.SSLGetNegotiatedGroupReturn, optional: true},
+		{symbol: "SSL_CTX_get_keylog_callback", offset: openSSLKeylogSecretHelperOffset, enter: objects.SSLKeylogSecretEnter, optional: true},
 		{symbol: "SSL_read", enter: objects.SSLReadEnter, ret: objects.SSLReadReturn, optional: true},
 		{symbol: "SSL_write", enter: objects.SSLWriteEnter, ret: objects.SSLWriteReturn, optional: true},
 	}

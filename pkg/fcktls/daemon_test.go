@@ -398,6 +398,121 @@ func TestDaemonRetriesTLS12InspectionWhenMetadataArrivesBeforeKeys(t *testing.T)
 	}
 }
 
+func TestDaemonMergesTLS13KeyMaterialEvent(t *testing.T) {
+	now := time.Date(2026, 5, 10, 0, 0, 0, 0, time.UTC)
+	cfg, err := NewConfig("curl", false, t.TempDir())
+	if err != nil {
+		t.Fatalf("NewConfig() error = %v", err)
+	}
+
+	d := &Daemon{
+		Config:    cfg,
+		OpenSSL:   &stubOpenSSLLoader{attachedPaths: []string{"/usr/lib/libssl.so.3"}},
+		Monitor:   NewProcessMonitor("curl", staticExeResolver{paths: map[int]string{808: "/usr/bin/curl"}}),
+		Now:       func() time.Time { return now },
+		Stdout:    io.Discard,
+		Artifacts: NewArtifactWriter(cfg.CacheRoot),
+		Store:     NewSessionStore(),
+	}
+	tracked := map[int]ProcessMatch{
+		808: {PID: 808, ExePath: "/usr/bin/curl", Basename: "curl"},
+	}
+	seen := map[int]bool{808: false}
+	fds := make(map[SessionKey]int)
+
+	var random [32]byte
+	for i := range random {
+		random[i] = byte(i)
+	}
+	var secret [64]byte
+	for i := 0; i < 48; i++ {
+		secret[i] = byte(0xa0 + i)
+	}
+
+	d.handleOpenSSLEvent(ebpf.OpenSSLEvent{
+		PID:                808,
+		TimestampNS:        uint64(now.UnixNano()),
+		SessionPtr:         0x8,
+		ProbeKind:          ebpf.OpenSSLProbeKindSSLConnect,
+		EventType:          ebpf.OpenSSLEventTypeKeyMaterial,
+		ClientRandomLength: 32,
+		SecretLength:       48,
+		SNIBytes:           toSNIBytes("CLIENT_TRAFFIC_SECRET_0"),
+		ClientRandom:       random,
+		Secret:             secret,
+	}, tracked, seen, fds)
+
+	snapshot, ok := d.Store.Finalize(SessionKey{PID: 808, SSLPointer: 0x8}, now.Add(time.Millisecond))
+	if !ok {
+		t.Fatal("Finalize() ok = false, want true")
+	}
+	if got, want := snapshot.Metadata.KeyStatus, KeyStatusAvailable; got != want {
+		t.Fatalf("KeyStatus = %q, want %q", got, want)
+	}
+	if got, want := len(snapshot.Metadata.KeyLogLines), 1; got != want {
+		t.Fatalf("len(KeyLogLines) = %d, want %d", got, want)
+	}
+	if got, want := snapshot.Metadata.KeyLogLines[0], "CLIENT_TRAFFIC_SECRET_0 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F A0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECF"; got != want {
+		t.Fatalf("KeyLogLines[0] = %q, want %q", got, want)
+	}
+}
+
+func TestDaemonInspectsOnTLS13KeyMaterialEvent(t *testing.T) {
+	now := time.Date(2026, 5, 10, 0, 0, 0, 0, time.UTC)
+	cfg, err := NewConfig("curl", false, t.TempDir())
+	if err != nil {
+		t.Fatalf("NewConfig() error = %v", err)
+	}
+
+	inspector := &sequenceInspector{
+		results: []inspectionResult{
+			{inspection: OpenSSLInspection{
+				TLSVersion:    "TLSv1.3",
+				CipherSuite:   "TLS_AES_256_GCM_SHA384",
+				KeyStatus:     KeyStatusUnavailable,
+				KeyStatusNote: "TLS 1.3 key export unavailable via OpenSSL public getters; requires keylog callback or deeper hooks",
+			}},
+		},
+	}
+
+	d := &Daemon{
+		Config:    cfg,
+		OpenSSL:   &stubOpenSSLLoader{attachedPaths: []string{"/usr/lib/libssl.so.3"}},
+		Inspector: inspector,
+		Monitor:   NewProcessMonitor("curl", staticExeResolver{paths: map[int]string{909: "/usr/bin/curl"}}),
+		Now:       func() time.Time { return now },
+		Stdout:    io.Discard,
+		Artifacts: NewArtifactWriter(cfg.CacheRoot),
+		Store:     NewSessionStore(),
+	}
+	tracked := map[int]ProcessMatch{
+		909: {PID: 909, ExePath: "/usr/bin/curl", Basename: "curl"},
+	}
+	seen := map[int]bool{909: false}
+	fds := make(map[SessionKey]int)
+
+	d.handleOpenSSLEvent(ebpf.OpenSSLEvent{
+		PID:                909,
+		TimestampNS:        uint64(now.UnixNano()),
+		SessionPtr:         0x9,
+		EventType:          ebpf.OpenSSLEventTypeKeyMaterial,
+		ClientRandomLength: 32,
+		SecretLength:       48,
+		SNIBytes:           toSNIBytes("CLIENT_TRAFFIC_SECRET_0"),
+	}, tracked, seen, fds)
+
+	snapshot, ok := d.Store.Finalize(SessionKey{PID: 909, SSLPointer: 0x9}, now.Add(time.Millisecond))
+	if !ok {
+		t.Fatal("Finalize() ok = false, want true")
+	}
+	if got, want := inspector.calls, 1; got != want {
+		t.Fatalf("inspector calls = %d, want %d", got, want)
+	}
+	if got, want := snapshot.Metadata.TLSVersion, "TLSv1.3"; got != want {
+		t.Fatalf("TLSVersion = %q, want %q", got, want)
+	}
+}
+
 func TestDaemonIgnoresUnmatchedExec(t *testing.T) {
 	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
 	procLoader := &stubProcessEventLoader{

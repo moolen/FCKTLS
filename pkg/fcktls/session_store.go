@@ -151,10 +151,10 @@ func (r *sessionRecord) mergeMetadata(update SessionMetadataUpdate) {
 	if update.ALPN != "" {
 		r.metadata.ALPN = update.ALPN
 	}
-	if update.KeyStatus != "" {
+	if update.KeyStatus != "" && !shouldPreserveAvailableKeyStatus(r.metadata, update) {
 		r.metadata.KeyStatus = update.KeyStatus
 	}
-	if update.KeyStatusNote != "" {
+	if update.KeyStatusNote != "" && !shouldPreserveAvailableKeyStatus(r.metadata, update) {
 		r.metadata.KeyStatusNote = update.KeyStatusNote
 	}
 	if update.CaptureMode != "" {
@@ -246,6 +246,11 @@ func appendUniqueCertificates(existing []CertificateSummary, values []Certificat
 	}
 
 	return existing
+}
+
+func shouldPreserveAvailableKeyStatus(current SessionMetadata, update SessionMetadataUpdate) bool {
+	return current.KeyStatus == KeyStatusAvailable && len(current.KeyLogLines) > 0 &&
+		update.KeyStatus != "" && update.KeyStatus != KeyStatusAvailable && len(update.KeyLogLines) == 0
 }
 
 func cloneInt(value *int) *int {

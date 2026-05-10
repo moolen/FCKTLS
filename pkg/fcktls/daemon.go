@@ -2,6 +2,7 @@ package fcktls
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -260,6 +261,15 @@ func (d *Daemon) handleOpenSSLEvent(event ebpf.OpenSSLEvent, tracked map[int]Pro
 	case ebpf.OpenSSLEventTypeNegotiatedGroup:
 		negotiatedGroup := int(event.Value)
 		update.NegotiatedGroup = &negotiatedGroup
+	case ebpf.OpenSSLEventTypeKeyMaterial:
+		if line, ok := formatOpenSSLKeyMaterialLine(event); ok {
+			if isTLS13KeyLogLabel(event.StringPayload()) {
+				update.TLSVersion = "TLSv1.3"
+			}
+			update.KeyStatus = KeyStatusAvailable
+			update.KeyStatusNote = "openssl key material captured via uprobe"
+			update.KeyLogLines = []string{line}
+		}
 	case ebpf.OpenSSLEventTypeHandshake:
 		if event.Value > 0 {
 			if d.Inspector == nil {
@@ -313,7 +323,7 @@ func (d *Daemon) shouldInspectOpenSSLEvent(event ebpf.OpenSSLEvent) bool {
 	switch event.EventType {
 	case ebpf.OpenSSLEventTypeHandshake:
 		return event.Value > 0
-	case ebpf.OpenSSLEventTypeVerifyResult, ebpf.OpenSSLEventTypeSessionReused, ebpf.OpenSSLEventTypeNegotiatedGroup:
+	case ebpf.OpenSSLEventTypeVerifyResult, ebpf.OpenSSLEventTypeSessionReused, ebpf.OpenSSLEventTypeNegotiatedGroup, ebpf.OpenSSLEventTypeKeyMaterial:
 		return true
 	default:
 		return false
@@ -395,6 +405,31 @@ func inspectionComplete(inspection OpenSSLInspection) bool {
 	}
 
 	return false
+}
+
+func formatOpenSSLKeyMaterialLine(event ebpf.OpenSSLEvent) (string, bool) {
+	label := strings.TrimSpace(event.StringPayload())
+	if label == "" || event.ClientRandomLength == 0 || event.SecretLength == 0 {
+		return "", false
+	}
+	if int(event.ClientRandomLength) > len(event.ClientRandom) || int(event.SecretLength) > len(event.Secret) {
+		return "", false
+	}
+	clientRandom := strings.ToUpper(hex.EncodeToString(event.ClientRandom[:event.ClientRandomLength]))
+	secret := strings.ToUpper(hex.EncodeToString(event.Secret[:event.SecretLength]))
+	if clientRandom == "" || secret == "" {
+		return "", false
+	}
+	return fmt.Sprintf("%s %s %s", label, clientRandom, secret), true
+}
+
+func isTLS13KeyLogLabel(label string) bool {
+	switch strings.TrimSpace(label) {
+	case "CLIENT_EARLY_TRAFFIC_SECRET", "CLIENT_HANDSHAKE_TRAFFIC_SECRET", "SERVER_HANDSHAKE_TRAFFIC_SECRET", "CLIENT_TRAFFIC_SECRET_0", "SERVER_TRAFFIC_SECRET_0", "EARLY_EXPORTER_SECRET", "EXPORTER_SECRET":
+		return true
+	default:
+		return false
+	}
 }
 
 func (d *Daemon) flushSnapshot(snapshot SessionSnapshot) {

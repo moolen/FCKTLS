@@ -96,6 +96,7 @@ type openssl_uprobeProgramSpecs struct {
 	OpensslSslGetNegotiatedGroupReturn *ebpf.ProgramSpec `ebpf:"openssl_ssl_get_negotiated_group_return"`
 	OpensslSslGetVerifyResultEnter     *ebpf.ProgramSpec `ebpf:"openssl_ssl_get_verify_result_enter"`
 	OpensslSslGetVerifyResultReturn    *ebpf.ProgramSpec `ebpf:"openssl_ssl_get_verify_result_return"`
+	OpensslSslKeylogSecretEnter        *ebpf.ProgramSpec `ebpf:"openssl_ssl_keylog_secret_enter"`
 	OpensslSslReadEnter                *ebpf.ProgramSpec `ebpf:"openssl_ssl_read_enter"`
 	OpensslSslReadReturn               *ebpf.ProgramSpec `ebpf:"openssl_ssl_read_return"`
 	OpensslSslSessionReusedEnter       *ebpf.ProgramSpec `ebpf:"openssl_ssl_session_reused_enter"`
@@ -200,6 +201,7 @@ type openssl_uprobePrograms struct {
 	OpensslSslGetNegotiatedGroupReturn *ebpf.Program `ebpf:"openssl_ssl_get_negotiated_group_return"`
 	OpensslSslGetVerifyResultEnter     *ebpf.Program `ebpf:"openssl_ssl_get_verify_result_enter"`
 	OpensslSslGetVerifyResultReturn    *ebpf.Program `ebpf:"openssl_ssl_get_verify_result_return"`
+	OpensslSslKeylogSecretEnter        *ebpf.Program `ebpf:"openssl_ssl_keylog_secret_enter"`
 	OpensslSslReadEnter                *ebpf.Program `ebpf:"openssl_ssl_read_enter"`
 	OpensslSslReadReturn               *ebpf.Program `ebpf:"openssl_ssl_read_return"`
 	OpensslSslSessionReusedEnter       *ebpf.Program `ebpf:"openssl_ssl_session_reused_enter"`
@@ -227,6 +229,7 @@ func (p *openssl_uprobePrograms) Close() error {
 		p.OpensslSslGetNegotiatedGroupReturn,
 		p.OpensslSslGetVerifyResultEnter,
 		p.OpensslSslGetVerifyResultReturn,
+		p.OpensslSslKeylogSecretEnter,
 		p.OpensslSslReadEnter,
 		p.OpensslSslReadReturn,
 		p.OpensslSslSessionReusedEnter,

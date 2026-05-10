@@ -12,6 +12,7 @@ import (
 
 type uprobeAttachSpec struct {
 	symbol   string
+	offset   uint64
 	enter    *cebpf.Program
 	ret      *cebpf.Program
 	optional bool
@@ -22,10 +23,24 @@ func attachUprobeSpecs(executable *link.Executable, libraryPath string, specs []
 		libraryPath,
 		specs,
 		func(symbol string, prog *cebpf.Program) (link.Link, error) {
-			return executable.Uprobe(symbol, prog, nil)
+			var offset uint64
+			for _, spec := range specs {
+				if spec.symbol == symbol && spec.enter == prog {
+					offset = spec.offset
+					break
+				}
+			}
+			return executable.Uprobe(symbol, prog, &link.UprobeOptions{Offset: offset})
 		},
 		func(symbol string, prog *cebpf.Program) (link.Link, error) {
-			return executable.Uretprobe(symbol, prog, nil)
+			var offset uint64
+			for _, spec := range specs {
+				if spec.symbol == symbol && spec.ret == prog {
+					offset = spec.offset
+					break
+				}
+			}
+			return executable.Uretprobe(symbol, prog, &link.UprobeOptions{Offset: offset})
 		},
 	)
 }

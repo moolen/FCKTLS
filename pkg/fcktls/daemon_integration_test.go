@@ -164,6 +164,135 @@ func TestE2ETLS12ClientRandomExport(t *testing.T) {
 	}
 }
 
+func TestE2ETLS13TrafficSecretExport(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("linux/amd64 only")
+	}
+	if os.Getenv("FCKTLS_E2E") == "" {
+		t.Skip("set FCKTLS_E2E=1 to run e2e test")
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("root required for eBPF and ptrace integration")
+	}
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl not installed")
+	}
+
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "tls13-ok\n")
+	}))
+	server.EnableHTTP2 = false
+	server.TLS = &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		MaxVersion: tls.VersionTLS13,
+		NextProtos: []string{"http/1.1"},
+	}
+	server.StartTLS()
+	defer server.Close()
+
+	cacheRoot := t.TempDir()
+	cfg, err := NewConfig("curl", false, cacheRoot)
+	if err != nil {
+		t.Fatalf("NewConfig() error = %v", err)
+	}
+
+	daemon, err := NewDaemon(cfg)
+	if err != nil {
+		t.Fatalf("NewDaemon() error = %v", err)
+	}
+	daemon.Stdout = io.Discard
+
+	ready := make(chan struct{})
+	daemon.OnReady = func() { close(ready) }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runErrCh := make(chan error, 1)
+	go func() {
+		runErrCh <- daemon.Run(ctx)
+	}()
+
+	select {
+	case <-ready:
+	case err := <-runErrCh:
+		t.Fatalf("daemon exited before ready: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for daemon readiness")
+	}
+
+	curlOutputPath := filepath.Join(cacheRoot, "curl.out")
+	curlErrorPath := filepath.Join(cacheRoot, "curl.err")
+	curlStatusPath := filepath.Join(cacheRoot, "curl.status")
+	curlPID, err := launchDetachedCommand(
+		curlOutputPath,
+		curlErrorPath,
+		curlStatusPath,
+		"curl",
+		"--silent",
+		"--show-error",
+		"--insecure",
+		"--http1.1",
+		server.URL,
+	)
+	if err != nil {
+		t.Fatalf("launchDetachedCommand() error = %v", err)
+	}
+	defer terminateDetachedProcessGroup(curlPID)
+
+	result, err := waitForDetachedCommand(curlStatusPath, 15*time.Second)
+	if err != nil {
+		stdout, _ := os.ReadFile(curlOutputPath)
+		stderr, _ := os.ReadFile(curlErrorPath)
+		t.Fatalf("waitForDetachedCommand() error = %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	if got, want := result.ExitCode, 0; got != want {
+		stdout, _ := os.ReadFile(curlOutputPath)
+		stderr, _ := os.ReadFile(curlErrorPath)
+		t.Fatalf("curl exit code = %d, want %d\nstdout:\n%s\nstderr:\n%s", got, want, stdout, stderr)
+	}
+
+	summaryPath, keysPath, err := waitForSessionFiles(cacheRoot, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cancel()
+	if err := <-runErrCh; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("daemon.Run() error = %v", err)
+	}
+
+	rawSummary, err := os.ReadFile(summaryPath)
+	if err != nil {
+		t.Fatalf("ReadFile(summary.json) error = %v", err)
+	}
+
+	var summary struct {
+		Metadata SessionMetadata `json:"metadata"`
+	}
+	if err := json.Unmarshal(rawSummary, &summary); err != nil {
+		t.Fatalf("Unmarshal(summary.json) error = %v", err)
+	}
+	if got, want := summary.Metadata.TLSVersion, "TLSv1.3"; got != want {
+		t.Fatalf("TLSVersion = %q, want %q", got, want)
+	}
+	if got, want := summary.Metadata.KeyStatus, KeyStatusAvailable; got != want {
+		t.Fatalf("KeyStatus = %q, want %q", got, want)
+	}
+
+	rawKeys, err := os.ReadFile(keysPath)
+	if err != nil {
+		t.Fatalf("ReadFile(keys.log) error = %v", err)
+	}
+	keyText := string(rawKeys)
+	if !strings.Contains(keyText, "CLIENT_TRAFFIC_SECRET_0 ") &&
+		!strings.Contains(keyText, "SERVER_TRAFFIC_SECRET_0 ") &&
+		!strings.Contains(keyText, "CLIENT_HANDSHAKE_TRAFFIC_SECRET ") &&
+		!strings.Contains(keyText, "SERVER_HANDSHAKE_TRAFFIC_SECRET ") {
+		t.Fatalf("keys.log = %q, want TLS 1.3 traffic secret entry", rawKeys)
+	}
+}
+
 func waitForSessionFiles(cacheRoot string, timeout time.Duration) (string, string, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {

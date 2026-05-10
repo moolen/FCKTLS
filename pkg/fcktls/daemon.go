@@ -34,11 +34,20 @@ type gnuTLSReader interface {
 	Close() error
 }
 
+type goTLSReader interface {
+	AttachProcess(pid int, executablePath string) error
+	ReadGoTLSEvent() (ebpf.GoTLSEvent, error)
+	Close() error
+}
+
 type Daemon struct {
 	Config               Config
 	ProcessEvents        processEventReader
 	OpenSSL              openSSLReader
 	GnuTLS               gnuTLSReader
+	GoTLS                goTLSReader
+	GoExecGate           *GoExecGate
+	GoInspector          GoTLSInspector
 	Inspector            OpenSSLInspector
 	Monitor              ProcessMonitor
 	OpenSSLLibraryFinder func() ([]string, error)
@@ -69,13 +78,22 @@ func NewDaemon(cfg Config) (*Daemon, error) {
 		_ = processEvents.Close()
 		return nil, err
 	}
+	goTLS, err := ebpf.NewGoTLSLoader()
+	if err != nil {
+		_ = gnutls.Close()
+		_ = openssl.Close()
+		_ = processEvents.Close()
+		return nil, err
+	}
 
-	return &Daemon{
+	daemon := &Daemon{
 		Config:               cfg,
 		ProcessEvents:        processEvents,
 		OpenSSL:              openssl,
 		GnuTLS:               gnutls,
+		GoTLS:                goTLS,
 		Inspector:            newDefaultOpenSSLInspector(),
+		GoInspector:          newDefaultGoTLSInspector(),
 		Monitor:              NewProcessMonitor(cfg.Target, nil),
 		OpenSSLLibraryFinder: discoverOpenSSLLibraries,
 		GnuTLSLibraryFinder:  discoverGnuTLSLibraries,
@@ -83,7 +101,9 @@ func NewDaemon(cfg Config) (*Daemon, error) {
 		Stdout:               os.Stdout,
 		Artifacts:            NewArtifactWriter(cfg.CacheRoot),
 		Store:                NewSessionStore(),
-	}, nil
+	}
+	daemon.GoExecGate = NewGoExecGate(goTLS)
+	return daemon, nil
 }
 
 func (d *Daemon) Run(ctx context.Context) error {
@@ -126,6 +146,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if d.GnuTLS != nil {
 		defer d.GnuTLS.Close()
 	}
+	if d.GoTLS != nil {
+		defer d.GoTLS.Close()
+	}
 
 	if err := d.attachLibraries(); err != nil {
 		return err
@@ -141,7 +164,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	appCh := make(chan ebpf.OpenSSLAppDataEvent, 64)
 	gnutlsCh := make(chan ebpf.GnuTLSEvent, 64)
 	gnutlsAppCh := make(chan ebpf.GnuTLSAppDataEvent, 64)
-	errCh := make(chan error, 5)
+	goTLSCh := make(chan ebpf.GoTLSEvent, 64)
+	errCh := make(chan error, 6)
 
 	go func() {
 		<-ctx.Done()
@@ -149,6 +173,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		_ = d.OpenSSL.Close()
 		if d.GnuTLS != nil {
 			_ = d.GnuTLS.Close()
+		}
+		if d.GoTLS != nil {
+			_ = d.GoTLS.Close()
 		}
 	}()
 
@@ -158,6 +185,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		go pumpGnuTLSEvents(d.GnuTLS, gnutlsCh, errCh)
 	} else {
 		close(gnutlsCh)
+	}
+	if d.GoTLS != nil {
+		go pumpGoTLSEvents(d.GoTLS, goTLSCh, errCh)
+	} else {
+		close(goTLSCh)
 	}
 	if d.Config.CaptureMode == CaptureModeCapture {
 		go pumpOpenSSLAppDataEvents(d.OpenSSL, appCh, errCh)
@@ -177,7 +209,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
-	for procCh != nil || sslCh != nil || appCh != nil || gnutlsCh != nil || gnutlsAppCh != nil {
+	for procCh != nil || sslCh != nil || appCh != nil || gnutlsCh != nil || gnutlsAppCh != nil || goTLSCh != nil {
 		select {
 		case <-ctx.Done():
 			for pid, match := range tracked {
@@ -221,6 +253,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 				continue
 			}
 			d.handleGnuTLSAppDataEvent(event, tracked)
+		case event, ok := <-goTLSCh:
+			if !ok {
+				goTLSCh = nil
+				continue
+			}
+			d.handleGoTLSEvent(event, tracked, seenTLS, fdBySession)
 		}
 	}
 
@@ -251,10 +289,20 @@ func (d *Daemon) handleProcessEvent(event ebpf.ProcessEvent, tracked map[int]Pro
 		}
 		tracked[pid] = match
 		seenTLS[pid] = false
+		if d.shouldGateGoProcess(match) {
+			attached, err := d.GoExecGate.HandleMatch(match)
+			if err == nil && attached {
+				seenTLS[pid] = true
+			}
+		}
 		delete(exited, pid)
 	case ebpf.ProcessEventTypeExit:
 		exited[pid] = time.Unix(0, int64(event.TimestampNS))
 	}
+}
+
+func (d *Daemon) shouldGateGoProcess(match ProcessMatch) bool {
+	return d != nil && d.GoTLS != nil && d.GoExecGate != nil && match.PID > 0 && strings.TrimSpace(match.ExePath) != ""
 }
 
 func (d *Daemon) handleOpenSSLEvent(event ebpf.OpenSSLEvent, tracked map[int]ProcessMatch, seenTLS map[int]bool, fdBySession map[SessionKey]int) {
@@ -376,6 +424,51 @@ func (d *Daemon) handleGnuTLSEvent(event ebpf.GnuTLSEvent, tracked map[int]Proce
 		} else {
 			update.KeyStatus = KeyStatusPartial
 			update.KeyStatusNote = "gnutls handshake incomplete"
+		}
+	}
+
+	_ = d.Store.MergeMetadata(update)
+}
+
+func (d *Daemon) handleGoTLSEvent(event ebpf.GoTLSEvent, tracked map[int]ProcessMatch, seenTLS map[int]bool, fdBySession map[SessionKey]int) {
+	match, ok := tracked[int(event.PID)]
+	if !ok || event.ConnPtr == 0 {
+		return
+	}
+
+	seenTLS[int(event.PID)] = true
+	key := SessionKey{PID: int(event.PID), SSLPointer: event.ConnPtr}
+	update := SessionMetadataUpdate{
+		Key:           key,
+		ObservedAt:    time.Unix(0, int64(event.TimestampNS)),
+		PID:           int(event.PID),
+		ExePath:       match.ExePath,
+		Role:          goTLSProbeKindRole(event.ProbeKind, true),
+		CaptureMode:   d.Config.CaptureMode,
+		KeyStatus:     KeyStatusUnavailable,
+		KeyStatusNote: goTLSUnavailableNote(d.Config.CaptureMode, "go key export not implemented"),
+	}
+
+	if d.GoInspector != nil {
+		inspection, ok, err := d.GoInspector.Inspect(int(event.PID), event.ConnPtr, event.ProbeKind)
+		if err != nil {
+			update.KeyStatus = KeyStatusPartial
+			update.KeyStatusNote = goTLSUnavailableNote(d.Config.CaptureMode, fmt.Sprintf("go tls inspection failed: %v", err))
+		} else if ok {
+			if inspection.Role != "" {
+				update.Role = inspection.Role
+			}
+			update.SNI = inspection.SNI
+			update.TLSVersion = inspection.TLSVersion
+			update.CipherSuite = inspection.CipherSuite
+			update.ALPN = inspection.ALPN
+			update.Certificates = inspection.Certificates
+			if inspection.KeyStatus != "" {
+				update.KeyStatus = inspection.KeyStatus
+			}
+			if note := strings.TrimSpace(inspection.KeyStatusNote); note != "" {
+				update.KeyStatusNote = goTLSUnavailableNote(d.Config.CaptureMode, note)
+			}
 		}
 	}
 
@@ -648,6 +741,20 @@ func firstAttachedLibraryPath(loader interface{}) string {
 	return ""
 }
 
+func goTLSUnavailableNote(mode CaptureMode, base string) string {
+	base = strings.TrimSpace(base)
+	if mode != CaptureModeCapture {
+		return base
+	}
+	if base == "" {
+		return "go plaintext capture not implemented"
+	}
+	if strings.Contains(base, "plaintext capture not implemented") {
+		return base
+	}
+	return base + "; plaintext capture not implemented"
+}
+
 func discoverOpenSSLLibraries() ([]string, error) {
 	return discoverLibraries("libssl.so")
 }
@@ -786,6 +893,20 @@ func pumpGnuTLSAppDataEvents(reader gnuTLSReader, out chan<- ebpf.GnuTLSAppDataE
 		if err != nil {
 			if !errors.Is(err, ringbuf.ErrClosed) {
 				errCh <- fmt.Errorf("read gnutls app data event: %w", err)
+			}
+			return
+		}
+		out <- event
+	}
+}
+
+func pumpGoTLSEvents(reader goTLSReader, out chan<- ebpf.GoTLSEvent, errCh chan<- error) {
+	defer close(out)
+	for {
+		event, err := reader.ReadGoTLSEvent()
+		if err != nil {
+			if !errors.Is(err, ringbuf.ErrClosed) {
+				errCh <- fmt.Errorf("read go tls event: %w", err)
 			}
 			return
 		}

@@ -51,6 +51,9 @@ func RenderSessionSummary(snapshot SessionSnapshot) string {
 	if len(metadata.Certificates) > 0 {
 		parts = append(parts, fmt.Sprintf("certs=%d", len(metadata.Certificates)))
 	}
+	if metadata.KeyStatusNote != "" {
+		parts = append(parts, fmt.Sprintf("note=%q", metadata.KeyStatusNote))
+	}
 	parts = append(parts,
 		fmt.Sprintf("key_status=%s", metadata.KeyStatus.String()),
 		fmt.Sprintf("capture=%s", metadata.CaptureMode.String()),

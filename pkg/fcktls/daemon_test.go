@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -677,6 +678,141 @@ func TestDaemonCapturesGnuTLSPlaintext(t *testing.T) {
 	}
 }
 
+func TestDaemonExecGatesSupportedGoTLSProcess(t *testing.T) {
+	now := time.Date(2026, 5, 10, 13, 0, 0, 0, time.UTC)
+	cfg, err := NewConfig("go-client", false, t.TempDir())
+	if err != nil {
+		t.Fatalf("NewConfig() error = %v", err)
+	}
+
+	goLoader := &stubGoTLSLoader{}
+	var calls []string
+	d := &Daemon{
+		Config:  cfg,
+		OpenSSL: &stubOpenSSLLoader{attachedPaths: []string{"/usr/lib/libssl.so.3"}},
+		GoTLS:   goLoader,
+		GoExecGate: &GoExecGate{
+			Loader: goLoader,
+			Inspect: func(path string) (goBinaryInspection, error) {
+				calls = append(calls, "inspect:"+path)
+				return goBinaryInspection{
+					IsGoBinary: true,
+					BinaryPath: "/opt/go-client",
+					Symbols: map[string]struct{}{
+						goTLSClientHandshakeSymbol: {},
+						goTLSConnectionStateSymbol: {},
+					},
+				}, nil
+			},
+			StopProcess: func(pid int) error {
+				calls = append(calls, "stop")
+				return nil
+			},
+			ResumeProcess: func(pid int) error {
+				calls = append(calls, "resume")
+				return nil
+			},
+		},
+		Monitor: NewProcessMonitor("go-client", staticExeResolver{
+			paths: map[int]string{909: "/usr/bin/go-client"},
+		}),
+		Now:   func() time.Time { return now },
+		Store: NewSessionStore(),
+	}
+	tracked := make(map[int]ProcessMatch)
+	seen := make(map[int]bool)
+	fds := make(map[SessionKey]int)
+	exited := make(map[int]time.Time)
+
+	d.handleProcessEvent(ebpf.ProcessEvent{
+		PID:         909,
+		EventType:   ebpf.ProcessEventTypeExec,
+		TimestampNS: uint64(now.UnixNano()),
+	}, tracked, seen, fds, exited)
+
+	match, ok := tracked[909]
+	if !ok {
+		t.Fatal("tracked pid missing after exec")
+	}
+	if got, want := match.ExePath, "/usr/bin/go-client"; got != want {
+		t.Fatalf("ExePath = %q, want %q", got, want)
+	}
+	if got, want := calls, []string{
+		"inspect:/usr/bin/go-client",
+		"stop",
+		"resume",
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("call order = %#v, want %#v", got, want)
+	}
+	if got, want := len(goLoader.attachCalls), 1; got != want {
+		t.Fatalf("len(attachCalls) = %d, want %d", got, want)
+	}
+	if got, want := goLoader.attachCalls[0], (goAttachCall{pid: 909, executablePath: "/opt/go-client"}); got != want {
+		t.Fatalf("attach call = %#v, want %#v", got, want)
+	}
+}
+
+func TestDaemonSkipsGoTLSGateForUnsupportedGoBinary(t *testing.T) {
+	now := time.Date(2026, 5, 10, 13, 0, 0, 0, time.UTC)
+	cfg, err := NewConfig("go-client", false, t.TempDir())
+	if err != nil {
+		t.Fatalf("NewConfig() error = %v", err)
+	}
+
+	goLoader := &stubGoTLSLoader{}
+	var calls []string
+	d := &Daemon{
+		Config:  cfg,
+		OpenSSL: &stubOpenSSLLoader{attachedPaths: []string{"/usr/lib/libssl.so.3"}},
+		GoTLS:   goLoader,
+		GoExecGate: &GoExecGate{
+			Loader: goLoader,
+			Inspect: func(path string) (goBinaryInspection, error) {
+				calls = append(calls, "inspect:"+path)
+				return goBinaryInspection{
+					IsGoBinary: true,
+					Symbols: map[string]struct{}{
+						"main.main": {},
+					},
+				}, nil
+			},
+			StopProcess: func(pid int) error {
+				calls = append(calls, "stop")
+				return nil
+			},
+			ResumeProcess: func(pid int) error {
+				calls = append(calls, "resume")
+				return nil
+			},
+		},
+		Monitor: NewProcessMonitor("go-client", staticExeResolver{
+			paths: map[int]string{910: "/usr/bin/go-client"},
+		}),
+		Now:   func() time.Time { return now },
+		Store: NewSessionStore(),
+	}
+	tracked := make(map[int]ProcessMatch)
+	seen := make(map[int]bool)
+	fds := make(map[SessionKey]int)
+	exited := make(map[int]time.Time)
+
+	d.handleProcessEvent(ebpf.ProcessEvent{
+		PID:         910,
+		EventType:   ebpf.ProcessEventTypeExec,
+		TimestampNS: uint64(now.UnixNano()),
+	}, tracked, seen, fds, exited)
+
+	if _, ok := tracked[910]; !ok {
+		t.Fatal("tracked pid missing after exec")
+	}
+	if got, want := calls, []string{"inspect:/usr/bin/go-client"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("call order = %#v, want %#v", got, want)
+	}
+	if len(goLoader.attachCalls) != 0 {
+		t.Fatalf("attachCalls = %#v, want none", goLoader.attachCalls)
+	}
+}
+
 func TestDaemonIgnoresUnmatchedExec(t *testing.T) {
 	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
 	procLoader := &stubProcessEventLoader{
@@ -779,6 +915,22 @@ type stubGnuTLSLoader struct {
 	appDataCh     chan ebpf.GnuTLSAppDataEvent
 }
 
+type goAttachCall struct {
+	pid            int
+	executablePath string
+}
+
+type stubGoTLSLoader struct {
+	attachCalls []goAttachCall
+	eventCh     chan ebpf.GoTLSEvent
+}
+
+type stubGoTLSInspector struct {
+	inspection GoTLSInspection
+	ok         bool
+	err        error
+}
+
 type stubInspector struct {
 	inspection OpenSSLInspection
 	err        error
@@ -862,6 +1014,28 @@ func (s *stubGnuTLSLoader) ReadGnuTLSAppDataEvent() (ebpf.GnuTLSAppDataEvent, er
 
 func (s *stubGnuTLSLoader) Close() error { return nil }
 
+func (s *stubGoTLSLoader) AttachProcess(pid int, executablePath string) error {
+	s.attachCalls = append(s.attachCalls, goAttachCall{pid: pid, executablePath: executablePath})
+	return nil
+}
+
+func (s *stubGoTLSLoader) ReadGoTLSEvent() (ebpf.GoTLSEvent, error) {
+	if s.eventCh == nil {
+		return ebpf.GoTLSEvent{}, ringbuf.ErrClosed
+	}
+	event, ok := <-s.eventCh
+	if !ok {
+		return ebpf.GoTLSEvent{}, ringbuf.ErrClosed
+	}
+	return event, nil
+}
+
+func (s *stubGoTLSLoader) Close() error { return nil }
+
+func (s stubGoTLSInspector) Inspect(pid int, connPtr uint64, probeKind ebpf.GoTLSProbeKind) (GoTLSInspection, bool, error) {
+	return s.inspection, s.ok, s.err
+}
+
 func newAppDataEvent(pid uint32, sessionPtr uint64, direction ebpf.OpenSSLAppDataDirection, data []byte) ebpf.OpenSSLAppDataEvent {
 	var payload [512]byte
 	copy(payload[:], data)
@@ -885,6 +1059,97 @@ func newGnuTLSAppDataEvent(pid uint32, sessionPtr uint64, direction ebpf.GnuTLSA
 		DataLen:       uint32(len(data)),
 		PayloadLength: uint32(len(data)),
 		Payload:       payload,
+	}
+}
+
+func TestDaemonMergesGoTLSMetadata(t *testing.T) {
+	now := time.Date(2026, 5, 10, 14, 0, 0, 0, time.UTC)
+	var stdout bytes.Buffer
+	cfg, err := NewConfig("go-client", true, t.TempDir())
+	if err != nil {
+		t.Fatalf("NewConfig() error = %v", err)
+	}
+
+	d := &Daemon{
+		Config: cfg,
+		GoTLS:  &stubGoTLSLoader{},
+		GoInspector: stubGoTLSInspector{
+			ok: true,
+			inspection: GoTLSInspection{
+				Role:        "client",
+				SNI:         "example.com",
+				TLSVersion:  "TLS 1.3",
+				CipherSuite: "TLS_AES_128_GCM_SHA256",
+				ALPN:        "h2",
+				KeyStatus:   KeyStatusUnavailable,
+			},
+		},
+		Monitor: NewProcessMonitor("go-client", staticExeResolver{
+			paths: map[int]string{1001: "/tmp/go-client"},
+		}),
+		Now:       func() time.Time { return now },
+		Stdout:    &stdout,
+		Artifacts: NewArtifactWriter(cfg.CacheRoot),
+		Store:     NewSessionStore(),
+	}
+	tracked := map[int]ProcessMatch{
+		1001: {PID: 1001, ExePath: "/tmp/go-client", Basename: "go-client"},
+	}
+	seen := map[int]bool{1001: false}
+	fds := make(map[SessionKey]int)
+	exited := map[int]time.Time{1001: now.Add(time.Second)}
+
+	d.handleGoTLSEvent(ebpf.GoTLSEvent{
+		PID:         1001,
+		TimestampNS: uint64(now.UnixNano()),
+		ConnPtr:     0x9,
+		ProbeKind:   ebpf.GoTLSProbeKindConnectionState,
+	}, tracked, seen, fds)
+	d.flushExited(tracked, seen, fds, exited, time.Unix(1<<62, 0))
+
+	for _, want := range []string{
+		"tls=TLS 1.3",
+		"cipher=TLS_AES_128_GCM_SHA256",
+		"alpn=h2",
+		"sni=example.com",
+		`note="go key export not implemented; plaintext capture not implemented"`,
+		"key_status=unavailable",
+		"capture=capture",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+		}
+	}
+
+	summaryPath := filepath.Join(cfg.CacheRoot, "pid-1001-ssl-0x9", "summary.json")
+	rawSummary, err := os.ReadFile(summaryPath)
+	if err != nil {
+		t.Fatalf("ReadFile(summary.json) error = %v", err)
+	}
+
+	var summary struct {
+		Metadata SessionMetadata `json:"metadata"`
+	}
+	if err := json.Unmarshal(rawSummary, &summary); err != nil {
+		t.Fatalf("Unmarshal(summary.json) error = %v", err)
+	}
+	if got, want := summary.Metadata.Role, "client"; got != want {
+		t.Fatalf("Role = %q, want %q", got, want)
+	}
+	if got, want := summary.Metadata.TLSVersion, "TLS 1.3"; got != want {
+		t.Fatalf("TLSVersion = %q, want %q", got, want)
+	}
+	if got, want := summary.Metadata.CipherSuite, "TLS_AES_128_GCM_SHA256"; got != want {
+		t.Fatalf("CipherSuite = %q, want %q", got, want)
+	}
+	if got, want := summary.Metadata.ALPN, "h2"; got != want {
+		t.Fatalf("ALPN = %q, want %q", got, want)
+	}
+	if got, want := summary.Metadata.KeyStatus, KeyStatusUnavailable; got != want {
+		t.Fatalf("KeyStatus = %q, want %q", got, want)
+	}
+	if got, want := summary.Metadata.KeyStatusNote, "go key export not implemented; plaintext capture not implemented"; got != want {
+		t.Fatalf("KeyStatusNote = %q, want %q", got, want)
 	}
 }
 

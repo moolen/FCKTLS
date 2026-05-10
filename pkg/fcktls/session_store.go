@@ -127,6 +127,9 @@ func (r *sessionRecord) mergeMetadata(update SessionMetadataUpdate) {
 	if update.SNI != "" {
 		r.metadata.SNI = update.SNI
 	}
+	if update.Priority != "" {
+		r.metadata.Priority = update.Priority
+	}
 	if update.Groups != "" {
 		r.metadata.Groups = update.Groups
 	}
@@ -190,6 +193,7 @@ func (r *sessionRecord) snapshot(finalizedAt time.Time) SessionSnapshot {
 			Role:            r.metadata.Role,
 			SocketFD:        cloneInt(r.metadata.SocketFD),
 			SNI:             r.metadata.SNI,
+			Priority:        r.metadata.Priority,
 			Groups:          r.metadata.Groups,
 			VerifyMode:      cloneInt(r.metadata.VerifyMode),
 			SessionReused:   cloneBool(r.metadata.SessionReused),

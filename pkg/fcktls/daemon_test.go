@@ -513,6 +513,170 @@ func TestDaemonInspectsOnTLS13KeyMaterialEvent(t *testing.T) {
 	}
 }
 
+func TestDaemonMergesGnuTLSMetadataEvent(t *testing.T) {
+	now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
+	var stdout bytes.Buffer
+	cfg, err := NewConfig("wget", false, t.TempDir())
+	if err != nil {
+		t.Fatalf("NewConfig() error = %v", err)
+	}
+
+	d := &Daemon{
+		Config: cfg,
+		GnuTLS: &stubGnuTLSLoader{attachedPaths: []string{"/usr/lib/libgnutls.so.30"}},
+		Monitor: NewProcessMonitor("wget", staticExeResolver{
+			paths: map[int]string{707: "/usr/bin/wget"},
+		}),
+		Now:       func() time.Time { return now },
+		Stdout:    &stdout,
+		Artifacts: NewArtifactWriter(cfg.CacheRoot),
+		Store:     NewSessionStore(),
+	}
+	tracked := map[int]ProcessMatch{
+		707: {PID: 707, ExePath: "/usr/bin/wget", Basename: "wget"},
+	}
+	seen := map[int]bool{707: false}
+	fds := make(map[SessionKey]int)
+	exited := map[int]time.Time{707: now.Add(time.Second)}
+
+	d.handleGnuTLSEvent(ebpf.GnuTLSEvent{
+		PID:         707,
+		TimestampNS: uint64(now.UnixNano()),
+		SessionPtr:  0x7,
+		EventType:   ebpf.GnuTLSEventTypeSetFD,
+		Value:       11,
+	}, tracked, seen, fds)
+	d.handleGnuTLSEvent(ebpf.GnuTLSEvent{
+		PID:         707,
+		TimestampNS: uint64(now.UnixNano()),
+		SessionPtr:  0x7,
+		EventType:   ebpf.GnuTLSEventTypeSetSNI,
+		Bytes:       toSNIBytes("example.com"),
+	}, tracked, seen, fds)
+	d.handleGnuTLSEvent(ebpf.GnuTLSEvent{
+		PID:         707,
+		TimestampNS: uint64(now.UnixNano()),
+		SessionPtr:  0x7,
+		EventType:   ebpf.GnuTLSEventTypeSetPriority,
+		Bytes:       toSNIBytes("NORMAL:-VERS-TLS1.3"),
+	}, tracked, seen, fds)
+	d.handleGnuTLSEvent(ebpf.GnuTLSEvent{
+		PID:         707,
+		TimestampNS: uint64(now.UnixNano()),
+		SessionPtr:  0x7,
+		EventType:   ebpf.GnuTLSEventTypeSessionResumed,
+		Value:       1,
+	}, tracked, seen, fds)
+	d.handleGnuTLSEvent(ebpf.GnuTLSEvent{
+		PID:         707,
+		TimestampNS: uint64(now.UnixNano()),
+		SessionPtr:  0x7,
+		EventType:   ebpf.GnuTLSEventTypeVerifyStatus,
+		Value:       0,
+	}, tracked, seen, fds)
+	d.handleGnuTLSEvent(ebpf.GnuTLSEvent{
+		PID:         707,
+		TimestampNS: uint64(now.UnixNano()),
+		SessionPtr:  0x7,
+		EventType:   ebpf.GnuTLSEventTypeNegotiatedGroup,
+		Value:       29,
+	}, tracked, seen, fds)
+	d.handleGnuTLSEvent(ebpf.GnuTLSEvent{
+		PID:         707,
+		TimestampNS: uint64(now.UnixNano()),
+		SessionPtr:  0x7,
+		EventType:   ebpf.GnuTLSEventTypeHandshake,
+		Value:       0,
+	}, tracked, seen, fds)
+	d.flushExited(tracked, seen, fds, exited, time.Unix(1<<62, 0))
+
+	for _, want := range []string{
+		"example.com",
+		"fd=11",
+		"priority=NORMAL:-VERS-TLS1.3",
+		"session_reused=true",
+		"verify_result=0",
+		"negotiated_group=29",
+		"key_status=unavailable",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+		}
+	}
+
+	summaryPath := filepath.Join(cfg.CacheRoot, "pid-707-ssl-0x7", "summary.json")
+	rawSummary, err := os.ReadFile(summaryPath)
+	if err != nil {
+		t.Fatalf("ReadFile(summary.json) error = %v", err)
+	}
+
+	var summary struct {
+		Metadata SessionMetadata `json:"metadata"`
+	}
+	if err := json.Unmarshal(rawSummary, &summary); err != nil {
+		t.Fatalf("Unmarshal(summary.json) error = %v", err)
+	}
+	if summary.Metadata.SocketFD == nil || *summary.Metadata.SocketFD != 11 {
+		t.Fatalf("socket_fd = %v, want 11", summary.Metadata.SocketFD)
+	}
+	if got, want := summary.Metadata.SNI, "example.com"; got != want {
+		t.Fatalf("SNI = %q, want %q", got, want)
+	}
+	if got, want := summary.Metadata.Priority, "NORMAL:-VERS-TLS1.3"; got != want {
+		t.Fatalf("Priority = %q, want %q", got, want)
+	}
+	if got, want := summary.Metadata.LibraryPath, "/usr/lib/libgnutls.so.30"; got != want {
+		t.Fatalf("LibraryPath = %q, want %q", got, want)
+	}
+}
+
+func TestDaemonCapturesGnuTLSPlaintext(t *testing.T) {
+	now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
+	var stdout bytes.Buffer
+	cfg, err := NewConfig("wget", true, t.TempDir())
+	if err != nil {
+		t.Fatalf("NewConfig() error = %v", err)
+	}
+
+	d := &Daemon{
+		Config: cfg,
+		GnuTLS: &stubGnuTLSLoader{attachedPaths: []string{"/usr/lib/libgnutls.so.30"}},
+		Monitor: NewProcessMonitor("wget", staticExeResolver{
+			paths: map[int]string{808: "/usr/bin/wget"},
+		}),
+		Now:       func() time.Time { return now },
+		Stdout:    &stdout,
+		Artifacts: NewArtifactWriter(cfg.CacheRoot),
+		Store:     NewSessionStore(),
+	}
+	tracked := map[int]ProcessMatch{
+		808: {PID: 808, ExePath: "/usr/bin/wget", Basename: "wget"},
+	}
+	seen := map[int]bool{808: false}
+	fds := make(map[SessionKey]int)
+	exited := map[int]time.Time{808: now.Add(time.Second)}
+
+	d.handleGnuTLSEvent(ebpf.GnuTLSEvent{
+		PID:         808,
+		TimestampNS: uint64(now.UnixNano()),
+		SessionPtr:  0x8,
+		EventType:   ebpf.GnuTLSEventTypeHandshake,
+		Value:       0,
+	}, tracked, seen, fds)
+	d.handleGnuTLSAppDataEvent(newGnuTLSAppDataEvent(808, 0x8, ebpf.GnuTLSAppDataDirectionWrite, []byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")), tracked)
+	d.handleGnuTLSAppDataEvent(newGnuTLSAppDataEvent(808, 0x8, ebpf.GnuTLSAppDataDirectionRead, []byte("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")), tracked)
+	d.flushExited(tracked, seen, fds, exited, time.Unix(1<<62, 0))
+
+	if !strings.Contains(stdout.String(), "GET / HTTP/1.1") || !strings.Contains(stdout.String(), "HTTP/1.1 200 OK") {
+		t.Fatalf("stdout = %q, want capture output", stdout.String())
+	}
+
+	requestPath := filepath.Join(cfg.CacheRoot, "pid-808-ssl-0x8", "request.txt")
+	if _, err := os.Stat(requestPath); err != nil {
+		t.Fatalf("request.txt stat error = %v", err)
+	}
+}
+
 func TestDaemonIgnoresUnmatchedExec(t *testing.T) {
 	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
 	procLoader := &stubProcessEventLoader{
@@ -544,9 +708,9 @@ func TestDaemonIgnoresUnmatchedExec(t *testing.T) {
 		Monitor: NewProcessMonitor("curl", staticExeResolver{
 			paths: map[int]string{303: "/usr/bin/wget"},
 		}),
-		LibraryFinder: func() ([]string, error) { return nil, nil },
-		Now:           func() time.Time { return now },
-		Stdout:        &stdout,
+		OpenSSLLibraryFinder: func() ([]string, error) { return nil, nil },
+		Now:                  func() time.Time { return now },
+		Stdout:               &stdout,
 	}
 
 	if err := d.Run(context.Background()); err != nil {
@@ -609,6 +773,12 @@ type stubOpenSSLLoader struct {
 	appDataCh     chan ebpf.OpenSSLAppDataEvent
 }
 
+type stubGnuTLSLoader struct {
+	attachedPaths []string
+	eventCh       chan ebpf.GnuTLSEvent
+	appDataCh     chan ebpf.GnuTLSAppDataEvent
+}
+
 type stubInspector struct {
 	inspection OpenSSLInspection
 	err        error
@@ -665,10 +835,50 @@ func (s *stubOpenSSLLoader) ReadOpenSSLAppDataEvent() (ebpf.OpenSSLAppDataEvent,
 
 func (s *stubOpenSSLLoader) Close() error { return nil }
 
+func (s *stubGnuTLSLoader) AttachedLibraryPaths() []string {
+	return append([]string(nil), s.attachedPaths...)
+}
+
+func (s *stubGnuTLSLoader) AttachLibraryPath(path string) error {
+	s.attachedPaths = append(s.attachedPaths, path)
+	return nil
+}
+
+func (s *stubGnuTLSLoader) ReadGnuTLSEvent() (ebpf.GnuTLSEvent, error) {
+	event, ok := <-s.eventCh
+	if !ok {
+		return ebpf.GnuTLSEvent{}, ringbuf.ErrClosed
+	}
+	return event, nil
+}
+
+func (s *stubGnuTLSLoader) ReadGnuTLSAppDataEvent() (ebpf.GnuTLSAppDataEvent, error) {
+	event, ok := <-s.appDataCh
+	if !ok {
+		return ebpf.GnuTLSAppDataEvent{}, ringbuf.ErrClosed
+	}
+	return event, nil
+}
+
+func (s *stubGnuTLSLoader) Close() error { return nil }
+
 func newAppDataEvent(pid uint32, sessionPtr uint64, direction ebpf.OpenSSLAppDataDirection, data []byte) ebpf.OpenSSLAppDataEvent {
 	var payload [512]byte
 	copy(payload[:], data)
 	return ebpf.OpenSSLAppDataEvent{
+		PID:           pid,
+		SessionPtr:    sessionPtr,
+		Direction:     direction,
+		DataLen:       uint32(len(data)),
+		PayloadLength: uint32(len(data)),
+		Payload:       payload,
+	}
+}
+
+func newGnuTLSAppDataEvent(pid uint32, sessionPtr uint64, direction ebpf.GnuTLSAppDataDirection, data []byte) ebpf.GnuTLSAppDataEvent {
+	var payload [512]byte
+	copy(payload[:], data)
+	return ebpf.GnuTLSAppDataEvent{
 		PID:           pid,
 		SessionPtr:    sessionPtr,
 		Direction:     direction,

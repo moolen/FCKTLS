@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -293,6 +294,151 @@ func TestE2ETLS13TrafficSecretExport(t *testing.T) {
 	}
 }
 
+func TestE2EGnuTLSCLIPlaintextCapture(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("linux/amd64 only")
+	}
+	if os.Getenv("FCKTLS_E2E") == "" {
+		t.Skip("set FCKTLS_E2E=1 to run e2e test")
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("root required for eBPF integration")
+	}
+	if _, err := exec.LookPath("gnutls-cli"); err != nil {
+		t.Skip("gnutls-cli not installed")
+	}
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "gnutls-ok\n")
+	}))
+	defer server.Close()
+
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(server.URL, "https://"))
+	if err != nil {
+		t.Fatalf("SplitHostPort(server.URL) error = %v", err)
+	}
+
+	cacheRoot := t.TempDir()
+	cfg, err := NewConfig("gnutls-cli", true, cacheRoot)
+	if err != nil {
+		t.Fatalf("NewConfig() error = %v", err)
+	}
+
+	daemon, err := NewDaemon(cfg)
+	if err != nil {
+		t.Fatalf("NewDaemon() error = %v", err)
+	}
+	daemon.Stdout = io.Discard
+
+	ready := make(chan struct{})
+	daemon.OnReady = func() { close(ready) }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runErrCh := make(chan error, 1)
+	go func() {
+		runErrCh <- daemon.Run(ctx)
+	}()
+
+	select {
+	case <-ready:
+	case err := <-runErrCh:
+		t.Fatalf("daemon exited before ready: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for daemon readiness")
+	}
+
+	clientOutputPath := filepath.Join(cacheRoot, "gnutls-cli.out")
+	clientErrorPath := filepath.Join(cacheRoot, "gnutls-cli.err")
+	clientStatusPath := filepath.Join(cacheRoot, "gnutls-cli.status")
+	clientPID, err := launchDetachedCommand(
+		clientOutputPath,
+		clientErrorPath,
+		clientStatusPath,
+		"sh",
+		"-c",
+		"printf 'GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' \"$1\" | gnutls-cli --insecure -p \"$2\" \"$1\"",
+		"gnutls-cli-e2e",
+		"localhost",
+		port,
+	)
+	if err != nil {
+		t.Fatalf("launchDetachedCommand() error = %v", err)
+	}
+	defer terminateDetachedProcessGroup(clientPID)
+
+	result, err := waitForDetachedCommand(clientStatusPath, 15*time.Second)
+	if err != nil {
+		stdout, _ := os.ReadFile(clientOutputPath)
+		stderr, _ := os.ReadFile(clientErrorPath)
+		t.Fatalf("waitForDetachedCommand() error = %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	if got, want := result.ExitCode, 0; got != want {
+		stdout, _ := os.ReadFile(clientOutputPath)
+		stderr, _ := os.ReadFile(clientErrorPath)
+		t.Fatalf("gnutls-cli exit code = %d, want %d\nstdout:\n%s\nstderr:\n%s", got, want, stdout, stderr)
+	}
+
+	output, err := os.ReadFile(clientOutputPath)
+	if err != nil {
+		t.Fatalf("ReadFile(gnutls-cli.out) error = %v", err)
+	}
+	if !strings.Contains(string(output), "gnutls-ok") {
+		t.Fatalf("gnutls-cli output = %q, want response body", output)
+	}
+
+	sessionDir, summaryPath, err := waitForSessionSummary(cacheRoot, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cancel()
+	if err := <-runErrCh; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("daemon.Run() error = %v", err)
+	}
+
+	rawSummary, err := os.ReadFile(summaryPath)
+	if err != nil {
+		t.Fatalf("ReadFile(summary.json) error = %v", err)
+	}
+
+	var summary struct {
+		Metadata SessionMetadata `json:"metadata"`
+	}
+	if err := json.Unmarshal(rawSummary, &summary); err != nil {
+		t.Fatalf("Unmarshal(summary.json) error = %v", err)
+	}
+
+	if !strings.HasSuffix(summary.Metadata.ExePath, "/gnutls-cli") {
+		t.Fatalf("ExePath = %q, want gnutls-cli", summary.Metadata.ExePath)
+	}
+	if !strings.Contains(summary.Metadata.LibraryPath, "libgnutls.so") {
+		t.Fatalf("LibraryPath = %q, want libgnutls.so", summary.Metadata.LibraryPath)
+	}
+	if got, want := summary.Metadata.CaptureMode, CaptureModeCapture; got != want {
+		t.Fatalf("CaptureMode = %q, want %q", got, want)
+	}
+
+	requestPath := filepath.Join(sessionDir, "request.txt")
+	request, err := os.ReadFile(requestPath)
+	if err != nil {
+		t.Fatalf("ReadFile(request.txt) error = %v", err)
+	}
+	if !strings.Contains(string(request), "GET / HTTP/1.1") {
+		t.Fatalf("request.txt = %q, want HTTP request", request)
+	}
+
+	responsePath := filepath.Join(sessionDir, "response.txt")
+	response, err := os.ReadFile(responsePath)
+	if err != nil {
+		t.Fatalf("ReadFile(response.txt) error = %v", err)
+	}
+	if !strings.Contains(string(response), "HTTP/1.1 200 OK") || !strings.Contains(string(response), "gnutls-ok") {
+		t.Fatalf("response.txt = %q, want HTTP response", response)
+	}
+}
+
 func waitForSessionFiles(cacheRoot string, timeout time.Duration) (string, string, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -317,4 +463,26 @@ func waitForSessionFiles(cacheRoot string, timeout time.Duration) (string, strin
 		time.Sleep(100 * time.Millisecond)
 	}
 	return "", "", errors.New("timed out waiting for session summary and keys")
+}
+
+func waitForSessionSummary(cacheRoot string, timeout time.Duration) (string, string, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		entries, err := os.ReadDir(cacheRoot)
+		if err == nil {
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					continue
+				}
+				dir := filepath.Join(cacheRoot, entry.Name())
+				summaryPath := filepath.Join(dir, "summary.json")
+				if _, err := os.Stat(summaryPath); err != nil {
+					continue
+				}
+				return dir, summaryPath, nil
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return "", "", errors.New("timed out waiting for session summary")
 }

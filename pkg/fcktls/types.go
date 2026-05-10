@@ -86,6 +86,7 @@ type SessionMetadata struct {
 	Role            string               `json:"role,omitempty"`
 	SocketFD        *int                 `json:"socket_fd,omitempty"`
 	SNI             string               `json:"sni,omitempty"`
+	Priority        string               `json:"priority,omitempty"`
 	Groups          string               `json:"groups,omitempty"`
 	VerifyMode      *int                 `json:"verify_mode,omitempty"`
 	SessionReused   *bool                `json:"session_reused,omitempty"`
@@ -125,6 +126,7 @@ type SessionMetadataUpdate struct {
 	Role            string
 	SocketFD        *int
 	SNI             string
+	Priority        string
 	Groups          string
 	VerifyMode      *int
 	SessionReused   *bool

@@ -21,6 +21,9 @@ func RenderSessionSummary(snapshot SessionSnapshot) string {
 	if metadata.SNI != "" {
 		parts = append(parts, fmt.Sprintf("sni=%s", metadata.SNI))
 	}
+	if metadata.Priority != "" {
+		parts = append(parts, fmt.Sprintf("priority=%s", metadata.Priority))
+	}
 	if metadata.Groups != "" {
 		parts = append(parts, fmt.Sprintf("groups=%s", metadata.Groups))
 	}

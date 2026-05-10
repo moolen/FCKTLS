@@ -27,18 +27,27 @@ type openSSLReader interface {
 	Close() error
 }
 
+type gnuTLSReader interface {
+	AttachLibraryPath(string) error
+	ReadGnuTLSEvent() (ebpf.GnuTLSEvent, error)
+	ReadGnuTLSAppDataEvent() (ebpf.GnuTLSAppDataEvent, error)
+	Close() error
+}
+
 type Daemon struct {
-	Config        Config
-	ProcessEvents processEventReader
-	OpenSSL       openSSLReader
-	Inspector     OpenSSLInspector
-	Monitor       ProcessMonitor
-	LibraryFinder func() ([]string, error)
-	Now           func() time.Time
-	Stdout        io.Writer
-	Artifacts     ArtifactWriter
-	Store         *SessionStore
-	OnReady       func()
+	Config               Config
+	ProcessEvents        processEventReader
+	OpenSSL              openSSLReader
+	GnuTLS               gnuTLSReader
+	Inspector            OpenSSLInspector
+	Monitor              ProcessMonitor
+	OpenSSLLibraryFinder func() ([]string, error)
+	GnuTLSLibraryFinder  func() ([]string, error)
+	Now                  func() time.Time
+	Stdout               io.Writer
+	Artifacts            ArtifactWriter
+	Store                *SessionStore
+	OnReady              func()
 
 	inspectedSessions map[SessionKey]bool
 	inspectAttempts   map[SessionKey]int
@@ -54,18 +63,26 @@ func NewDaemon(cfg Config) (*Daemon, error) {
 		_ = processEvents.Close()
 		return nil, err
 	}
+	gnutls, err := ebpf.NewGnuTLSLoader()
+	if err != nil {
+		_ = openssl.Close()
+		_ = processEvents.Close()
+		return nil, err
+	}
 
 	return &Daemon{
-		Config:        cfg,
-		ProcessEvents: processEvents,
-		OpenSSL:       openssl,
-		Inspector:     newDefaultOpenSSLInspector(),
-		Monitor:       NewProcessMonitor(cfg.Target, nil),
-		LibraryFinder: discoverOpenSSLLibraries,
-		Now:           time.Now,
-		Stdout:        os.Stdout,
-		Artifacts:     NewArtifactWriter(cfg.CacheRoot),
-		Store:         NewSessionStore(),
+		Config:               cfg,
+		ProcessEvents:        processEvents,
+		OpenSSL:              openssl,
+		GnuTLS:               gnutls,
+		Inspector:            newDefaultOpenSSLInspector(),
+		Monitor:              NewProcessMonitor(cfg.Target, nil),
+		OpenSSLLibraryFinder: discoverOpenSSLLibraries,
+		GnuTLSLibraryFinder:  discoverGnuTLSLibraries,
+		Now:                  time.Now,
+		Stdout:               os.Stdout,
+		Artifacts:            NewArtifactWriter(cfg.CacheRoot),
+		Store:                NewSessionStore(),
 	}, nil
 }
 
@@ -94,8 +111,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if d.Artifacts.CacheRoot == "" {
 		d.Artifacts = NewArtifactWriter(d.Config.CacheRoot)
 	}
-	if d.LibraryFinder == nil {
-		d.LibraryFinder = discoverOpenSSLLibraries
+	if d.OpenSSLLibraryFinder == nil {
+		d.OpenSSLLibraryFinder = discoverOpenSSLLibraries
+	}
+	if d.GnuTLSLibraryFinder == nil {
+		d.GnuTLSLibraryFinder = discoverGnuTLSLibraries
 	}
 	if d.ProcessEvents == nil || d.OpenSSL == nil {
 		return errors.New("daemon readers must be configured")
@@ -103,33 +123,52 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	defer d.ProcessEvents.Close()
 	defer d.OpenSSL.Close()
+	if d.GnuTLS != nil {
+		defer d.GnuTLS.Close()
+	}
 
 	if err := d.attachLibraries(); err != nil {
 		return err
 	}
 
 	tracked := make(map[int]ProcessMatch)
-	seenOpenSSL := make(map[int]bool)
+	seenTLS := make(map[int]bool)
 	fdBySession := make(map[SessionKey]int)
 	exited := make(map[int]time.Time)
 
 	procCh := make(chan ebpf.ProcessEvent, 32)
 	sslCh := make(chan ebpf.OpenSSLEvent, 64)
 	appCh := make(chan ebpf.OpenSSLAppDataEvent, 64)
-	errCh := make(chan error, 3)
+	gnutlsCh := make(chan ebpf.GnuTLSEvent, 64)
+	gnutlsAppCh := make(chan ebpf.GnuTLSAppDataEvent, 64)
+	errCh := make(chan error, 5)
 
 	go func() {
 		<-ctx.Done()
 		_ = d.ProcessEvents.Close()
 		_ = d.OpenSSL.Close()
+		if d.GnuTLS != nil {
+			_ = d.GnuTLS.Close()
+		}
 	}()
 
 	go pumpProcessEvents(d.ProcessEvents, procCh, errCh)
 	go pumpOpenSSLEvents(d.OpenSSL, sslCh, errCh)
+	if d.GnuTLS != nil {
+		go pumpGnuTLSEvents(d.GnuTLS, gnutlsCh, errCh)
+	} else {
+		close(gnutlsCh)
+	}
 	if d.Config.CaptureMode == CaptureModeCapture {
 		go pumpOpenSSLAppDataEvents(d.OpenSSL, appCh, errCh)
+		if d.GnuTLS != nil {
+			go pumpGnuTLSAppDataEvents(d.GnuTLS, gnutlsAppCh, errCh)
+		} else {
+			close(gnutlsAppCh)
+		}
 	} else {
 		close(appCh)
+		close(gnutlsAppCh)
 	}
 	if d.OnReady != nil {
 		d.OnReady()
@@ -138,7 +177,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
-	for procCh != nil || sslCh != nil || appCh != nil {
+	for procCh != nil || sslCh != nil || appCh != nil || gnutlsCh != nil || gnutlsAppCh != nil {
 		select {
 		case <-ctx.Done():
 			for pid, match := range tracked {
@@ -151,56 +190,58 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 		case <-ticker.C:
 			_ = d.attachLibraries()
-			d.flushExited(tracked, seenOpenSSL, fdBySession, exited, d.Now().Add(-100*time.Millisecond))
+			d.flushExited(tracked, seenTLS, fdBySession, exited, d.Now().Add(-100*time.Millisecond))
 		case event, ok := <-procCh:
 			if !ok {
 				procCh = nil
 				continue
 			}
-			d.handleProcessEvent(event, tracked, seenOpenSSL, fdBySession, exited)
+			d.handleProcessEvent(event, tracked, seenTLS, fdBySession, exited)
 		case event, ok := <-sslCh:
 			if !ok {
 				sslCh = nil
 				continue
 			}
-			d.handleOpenSSLEvent(event, tracked, seenOpenSSL, fdBySession)
+			d.handleOpenSSLEvent(event, tracked, seenTLS, fdBySession)
 		case event, ok := <-appCh:
 			if !ok {
 				appCh = nil
 				continue
 			}
 			d.handleAppDataEvent(event, tracked)
+		case event, ok := <-gnutlsCh:
+			if !ok {
+				gnutlsCh = nil
+				continue
+			}
+			d.handleGnuTLSEvent(event, tracked, seenTLS, fdBySession)
+		case event, ok := <-gnutlsAppCh:
+			if !ok {
+				gnutlsAppCh = nil
+				continue
+			}
+			d.handleGnuTLSAppDataEvent(event, tracked)
 		}
 	}
 
-	d.flushExited(tracked, seenOpenSSL, fdBySession, exited, time.Unix(1<<62, 0))
+	d.flushExited(tracked, seenTLS, fdBySession, exited, time.Unix(1<<62, 0))
 
 	return nil
 }
 
 func (d *Daemon) attachLibraries() error {
-	paths, err := d.LibraryFinder()
-	if err != nil {
-		return fmt.Errorf("discover openssl libraries: %w", err)
+	if err := attachLibrarySet(d.OpenSSL, d.OpenSSLLibraryFinder, "openssl"); err != nil {
+		return err
 	}
-	seen := make(map[string]struct{}, len(paths))
-	for _, path := range paths {
-		path = strings.TrimSpace(path)
-		if path == "" {
-			continue
-		}
-		if _, ok := seen[path]; ok {
-			continue
-		}
-		seen[path] = struct{}{}
-		if err := d.OpenSSL.AttachLibraryPath(path); err != nil {
+	if d.GnuTLS != nil {
+		if err := attachLibrarySet(d.GnuTLS, d.GnuTLSLibraryFinder, "gnutls"); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (d *Daemon) handleProcessEvent(event ebpf.ProcessEvent, tracked map[int]ProcessMatch, seenOpenSSL map[int]bool, fdBySession map[SessionKey]int, exited map[int]time.Time) {
+func (d *Daemon) handleProcessEvent(event ebpf.ProcessEvent, tracked map[int]ProcessMatch, seenTLS map[int]bool, fdBySession map[SessionKey]int, exited map[int]time.Time) {
 	pid := int(event.PID)
 	switch event.EventType {
 	case ebpf.ProcessEventTypeExec:
@@ -209,14 +250,14 @@ func (d *Daemon) handleProcessEvent(event ebpf.ProcessEvent, tracked map[int]Pro
 			return
 		}
 		tracked[pid] = match
-		seenOpenSSL[pid] = false
+		seenTLS[pid] = false
 		delete(exited, pid)
 	case ebpf.ProcessEventTypeExit:
 		exited[pid] = time.Unix(0, int64(event.TimestampNS))
 	}
 }
 
-func (d *Daemon) handleOpenSSLEvent(event ebpf.OpenSSLEvent, tracked map[int]ProcessMatch, seenOpenSSL map[int]bool, fdBySession map[SessionKey]int) {
+func (d *Daemon) handleOpenSSLEvent(event ebpf.OpenSSLEvent, tracked map[int]ProcessMatch, seenTLS map[int]bool, fdBySession map[SessionKey]int) {
 	match, ok := tracked[int(event.PID)]
 	if !ok || event.SessionPtr == 0 {
 		return
@@ -224,7 +265,7 @@ func (d *Daemon) handleOpenSSLEvent(event ebpf.OpenSSLEvent, tracked map[int]Pro
 	if d.inspectedSessions == nil {
 		d.inspectedSessions = make(map[SessionKey]bool)
 	}
-	seenOpenSSL[int(event.PID)] = true
+	seenTLS[int(event.PID)] = true
 	key := SessionKey{PID: int(event.PID), SSLPointer: event.SessionPtr}
 	update := SessionMetadataUpdate{
 		Key:         key,
@@ -289,6 +330,58 @@ func (d *Daemon) handleOpenSSLEvent(event ebpf.OpenSSLEvent, tracked map[int]Pro
 	_ = snapshot
 }
 
+func (d *Daemon) handleGnuTLSEvent(event ebpf.GnuTLSEvent, tracked map[int]ProcessMatch, seenTLS map[int]bool, fdBySession map[SessionKey]int) {
+	match, ok := tracked[int(event.PID)]
+	if !ok || event.SessionPtr == 0 {
+		return
+	}
+
+	seenTLS[int(event.PID)] = true
+	key := SessionKey{PID: int(event.PID), SSLPointer: event.SessionPtr}
+	update := SessionMetadataUpdate{
+		Key:         key,
+		ObservedAt:  time.Unix(0, int64(event.TimestampNS)),
+		PID:         int(event.PID),
+		ExePath:     match.ExePath,
+		LibraryPath: firstAttachedLibraryPath(d.GnuTLS),
+		CaptureMode: d.Config.CaptureMode,
+	}
+
+	switch event.EventType {
+	case ebpf.GnuTLSEventTypeSetSNI:
+		update.SNI = event.StringPayload()
+	case ebpf.GnuTLSEventTypeSetPriority:
+		update.Priority = event.StringPayload()
+	case ebpf.GnuTLSEventTypeSetFD:
+		fd := int(event.Value)
+		update.SocketFD = &fd
+		fdBySession[key] = fd
+		if local, peer, ok, err := resolveSocketTuple(int(event.PID), fd); err == nil && ok {
+			update.Source = &local
+			update.Destination = &peer
+		}
+	case ebpf.GnuTLSEventTypeSessionResumed:
+		reused := event.Value > 0
+		update.SessionReused = &reused
+	case ebpf.GnuTLSEventTypeVerifyStatus:
+		verifyResult := int(event.Value)
+		update.VerifyResult = &verifyResult
+	case ebpf.GnuTLSEventTypeNegotiatedGroup:
+		negotiatedGroup := int(event.Value)
+		update.NegotiatedGroup = &negotiatedGroup
+	case ebpf.GnuTLSEventTypeHandshake:
+		if event.Value == 0 {
+			update.KeyStatus = KeyStatusUnavailable
+			update.KeyStatusNote = "gnutls key export not implemented"
+		} else {
+			update.KeyStatus = KeyStatusPartial
+			update.KeyStatusNote = "gnutls handshake incomplete"
+		}
+	}
+
+	_ = d.Store.MergeMetadata(update)
+}
+
 func (d *Daemon) handleAppDataEvent(event ebpf.OpenSSLAppDataEvent, tracked map[int]ProcessMatch) {
 	if _, ok := tracked[int(event.PID)]; !ok || event.SessionPtr == 0 {
 		return
@@ -314,6 +407,26 @@ func (d *Daemon) handleAppDataEvent(event ebpf.OpenSSLAppDataEvent, tracked map[
 		Data:       append([]byte(nil), event.Payload[:event.PayloadLength]...),
 	})
 	_ = snapshot
+}
+
+func (d *Daemon) handleGnuTLSAppDataEvent(event ebpf.GnuTLSAppDataEvent, tracked map[int]ProcessMatch) {
+	if _, ok := tracked[int(event.PID)]; !ok || event.SessionPtr == 0 {
+		return
+	}
+
+	direction := StreamDirectionClientToServer
+	if event.Direction == ebpf.GnuTLSAppDataDirectionRead {
+		direction = StreamDirectionServerToClient
+	}
+	if event.PayloadLength > uint32(len(event.Payload)) {
+		return
+	}
+	_ = d.Store.AppendChunk(PlaintextChunk{
+		Key:        SessionKey{PID: int(event.PID), SSLPointer: event.SessionPtr},
+		Direction:  direction,
+		ObservedAt: time.Unix(0, int64(event.TimestampNS)),
+		Data:       append([]byte(nil), event.Payload[:event.PayloadLength]...),
+	})
 }
 
 func (d *Daemon) shouldInspectOpenSSLEvent(event ebpf.OpenSSLEvent) bool {
@@ -452,7 +565,7 @@ func (d *Daemon) emitUnsupportedRuntime(pid int, match ProcessMatch) {
 		PID:           pid,
 		ExePath:       match.ExePath,
 		KeyStatus:     KeyStatusUnknown,
-		KeyStatusNote: "matched process exited without OpenSSL events; unsupported runtime or no TLS activity",
+		KeyStatusNote: "matched process exited without OpenSSL or GnuTLS events; unsupported runtime or no TLS activity",
 		CaptureMode:   d.Config.CaptureMode,
 	})
 	if finalized, ok := d.Store.Finalize(SessionKey{PID: pid, SSLPointer: 0}, d.Now()); ok {
@@ -464,7 +577,7 @@ func (d *Daemon) emitUnsupportedRuntime(pid int, match ProcessMatch) {
 
 func (d *Daemon) flushExited(
 	tracked map[int]ProcessMatch,
-	seenOpenSSL map[int]bool,
+	seenTLS map[int]bool,
 	fdBySession map[SessionKey]int,
 	exited map[int]time.Time,
 	cutoff time.Time,
@@ -474,14 +587,14 @@ func (d *Daemon) flushExited(
 			continue
 		}
 		snapshots := d.Store.FinalizeByPID(pid, exitedAt)
-		if len(snapshots) == 0 && tracked[pid].PID != 0 && !seenOpenSSL[pid] {
+		if len(snapshots) == 0 && tracked[pid].PID != 0 && !seenTLS[pid] {
 			d.emitUnsupportedRuntime(pid, tracked[pid])
 		}
 		for _, snapshot := range snapshots {
 			d.flushSnapshot(snapshot)
 		}
 		delete(tracked, pid)
-		delete(seenOpenSSL, pid)
+		delete(seenTLS, pid)
 		delete(exited, pid)
 		for key := range fdBySession {
 			if key.PID == pid {
@@ -522,7 +635,7 @@ func roleFromProbeKind(kind ebpf.OpenSSLProbeKind) string {
 	}
 }
 
-func firstAttachedLibraryPath(loader openSSLReader) string {
+func firstAttachedLibraryPath(loader interface{}) string {
 	type attachmentGetter interface {
 		AttachedLibraryPaths() []string
 	}
@@ -536,6 +649,14 @@ func firstAttachedLibraryPath(loader openSSLReader) string {
 }
 
 func discoverOpenSSLLibraries() ([]string, error) {
+	return discoverLibraries("libssl.so")
+}
+
+func discoverGnuTLSLibraries() ([]string, error) {
+	return discoverLibraries("libgnutls.so")
+}
+
+func discoverLibraries(prefix string) ([]string, error) {
 	candidates := []string{
 		"/usr/lib",
 		"/usr/lib64",
@@ -556,7 +677,7 @@ func discoverOpenSSLLibraries() ([]string, error) {
 			if err != nil || info == nil || info.IsDir() {
 				return nil
 			}
-			if !strings.HasPrefix(info.Name(), "libssl.so") {
+			if !strings.HasPrefix(info.Name(), prefix) {
 				return nil
 			}
 			if _, ok := seen[path]; ok {
@@ -571,6 +692,35 @@ func discoverOpenSSLLibraries() ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+type libraryAttacher interface {
+	AttachLibraryPath(string) error
+}
+
+func attachLibrarySet(loader libraryAttacher, finder func() ([]string, error), label string) error {
+	if loader == nil || finder == nil {
+		return nil
+	}
+	paths, err := finder()
+	if err != nil {
+		return fmt.Errorf("discover %s libraries: %w", label, err)
+	}
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		if err := loader.AttachLibraryPath(path); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func pumpProcessEvents(reader processEventReader, out chan<- ebpf.ProcessEvent, errCh chan<- error) {
@@ -608,6 +758,34 @@ func pumpOpenSSLAppDataEvents(reader openSSLReader, out chan<- ebpf.OpenSSLAppDa
 		if err != nil {
 			if !errors.Is(err, ringbuf.ErrClosed) {
 				errCh <- fmt.Errorf("read openssl app data event: %w", err)
+			}
+			return
+		}
+		out <- event
+	}
+}
+
+func pumpGnuTLSEvents(reader gnuTLSReader, out chan<- ebpf.GnuTLSEvent, errCh chan<- error) {
+	defer close(out)
+	for {
+		event, err := reader.ReadGnuTLSEvent()
+		if err != nil {
+			if !errors.Is(err, ringbuf.ErrClosed) {
+				errCh <- fmt.Errorf("read gnutls event: %w", err)
+			}
+			return
+		}
+		out <- event
+	}
+}
+
+func pumpGnuTLSAppDataEvents(reader gnuTLSReader, out chan<- ebpf.GnuTLSAppDataEvent, errCh chan<- error) {
+	defer close(out)
+	for {
+		event, err := reader.ReadGnuTLSAppDataEvent()
+		if err != nil {
+			if !errors.Is(err, ringbuf.ErrClosed) {
+				errCh <- fmt.Errorf("read gnutls app data event: %w", err)
 			}
 			return
 		}

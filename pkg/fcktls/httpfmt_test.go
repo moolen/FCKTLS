@@ -19,6 +19,9 @@ func TestFormatHTTPParsesRequest(t *testing.T) {
 	if !strings.Contains(formatted.Text, "GET /hello HTTP/1.1") {
 		t.Fatalf("Text = %q, want request line", formatted.Text)
 	}
+	if !strings.Contains(formatted.Text, "Host: example.com") {
+		t.Fatalf("Text = %q, want host header", formatted.Text)
+	}
 
 	if !strings.Contains(formatted.Text, "world") {
 		t.Fatalf("Text = %q, want body", formatted.Text)

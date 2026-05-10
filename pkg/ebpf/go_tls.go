@@ -39,6 +39,30 @@ func (k GoTLSProbeKind) String() string {
 
 const goTLSEventSize = 32
 
+type GoTLSAppDataDirection uint8
+
+const (
+	GoTLSAppDataDirectionUnknown GoTLSAppDataDirection = iota
+	GoTLSAppDataDirectionRead
+	GoTLSAppDataDirectionWrite
+)
+
+func (d GoTLSAppDataDirection) String() string {
+	switch d {
+	case GoTLSAppDataDirectionRead:
+		return "read"
+	case GoTLSAppDataDirectionWrite:
+		return "write"
+	default:
+		return "unknown"
+	}
+}
+
+const (
+	goTLSMaxPayload       = 512
+	goTLSAppDataEventSize = 32 + goTLSMaxPayload
+)
+
 type GoTLSEvent struct {
 	TimestampNS uint64
 	PID         uint32
@@ -48,19 +72,38 @@ type GoTLSEvent struct {
 	_           [7]byte
 }
 
+type GoTLSAppDataEvent struct {
+	TimestampNS   uint64
+	PID           uint32
+	TID           uint32
+	ConnPtr       uint64
+	PayloadLength uint32
+	Direction     GoTLSAppDataDirection
+	_             [3]byte
+	Payload       [goTLSMaxPayload]byte
+}
+
 type GoTLSLoader struct {
-	objects     goTLSObjects
-	reader      *ringbuf.Reader
-	mu          sync.Mutex
-	attachments map[int][]link.Link
+	objects       goTLSObjects
+	reader        *ringbuf.Reader
+	appDataReader *ringbuf.Reader
+	mu            sync.Mutex
+	attachments   map[int][]link.Link
 }
 
 type goTLSObjects struct {
 	ClientHandshakeEnter *cebpf.Program `ebpf:"go_tls_client_handshake_enter"`
 	ServerHandshakeEnter *cebpf.Program `ebpf:"go_tls_server_handshake_enter"`
 	ConnectionState      *cebpf.Program `ebpf:"go_tls_connection_state"`
+	WriteEnter           *cebpf.Program `ebpf:"go_tls_write_enter"`
+	WriteReturn          *cebpf.Program `ebpf:"go_tls_write_return"`
+	ReadEnter            *cebpf.Program `ebpf:"go_tls_read_enter"`
+	ReadReturn           *cebpf.Program `ebpf:"go_tls_read_return"`
 	Events               *cebpf.Map     `ebpf:"go_tls_events"`
+	AppDataEvents        *cebpf.Map     `ebpf:"go_tls_app_data_events"`
 	PIDNamespaceConfig   *cebpf.Map     `ebpf:"go_tls_pidns_config_map"`
+	ReadPending          *cebpf.Map     `ebpf:"go_tls_read_pending"`
+	WritePending         *cebpf.Map     `ebpf:"go_tls_write_pending"`
 }
 
 type goTLSPIDNamespaceConfig struct {
@@ -88,11 +131,18 @@ func NewGoTLSLoader() (*GoTLSLoader, error) {
 		_ = objects.Close()
 		return nil, fmt.Errorf("new go tls ringbuf reader: %w", err)
 	}
+	appDataReader, err := ringbuf.NewReader(objects.AppDataEvents)
+	if err != nil {
+		_ = reader.Close()
+		_ = objects.Close()
+		return nil, fmt.Errorf("new go tls app data ringbuf reader: %w", err)
+	}
 
 	return &GoTLSLoader{
-		objects:     objects,
-		reader:      reader,
-		attachments: make(map[int][]link.Link),
+		objects:       objects,
+		reader:        reader,
+		appDataReader: appDataReader,
+		attachments:   make(map[int][]link.Link),
 	}, nil
 }
 
@@ -149,6 +199,19 @@ func (l *GoTLSLoader) ReadGoTLSEvent() (GoTLSEvent, error) {
 	return decodeGoTLSEvent(record.RawSample)
 }
 
+func (l *GoTLSLoader) ReadGoTLSAppDataEvent() (GoTLSAppDataEvent, error) {
+	if l == nil || l.appDataReader == nil {
+		return GoTLSAppDataEvent{}, errors.New("go tls app data reader is not initialized")
+	}
+
+	record, err := l.appDataReader.Read()
+	if err != nil {
+		return GoTLSAppDataEvent{}, err
+	}
+
+	return decodeGoTLSAppDataEvent(record.RawSample)
+}
+
 func decodeGoTLSEvent(raw []byte) (GoTLSEvent, error) {
 	if len(raw) < goTLSEventSize {
 		return GoTLSEvent{}, fmt.Errorf("decode go tls event: got %d bytes, want %d", len(raw), goTLSEventSize)
@@ -158,6 +221,25 @@ func decodeGoTLSEvent(raw []byte) (GoTLSEvent, error) {
 	if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &event); err != nil {
 		return GoTLSEvent{}, fmt.Errorf("decode go tls event: %w", err)
 	}
+	return event, nil
+}
+
+func decodeGoTLSAppDataEvent(raw []byte) (GoTLSAppDataEvent, error) {
+	if len(raw) < goTLSAppDataEventSize {
+		return GoTLSAppDataEvent{}, fmt.Errorf("decode go tls app data event: got %d bytes, want %d", len(raw), goTLSAppDataEventSize)
+	}
+
+	var event GoTLSAppDataEvent
+	event.TimestampNS = binary.LittleEndian.Uint64(raw[0:8])
+	event.PID = binary.LittleEndian.Uint32(raw[8:12])
+	event.TID = binary.LittleEndian.Uint32(raw[12:16])
+	event.ConnPtr = binary.LittleEndian.Uint64(raw[16:24])
+	event.PayloadLength = binary.LittleEndian.Uint32(raw[24:28])
+	event.Direction = GoTLSAppDataDirection(raw[28])
+	if event.PayloadLength > goTLSMaxPayload {
+		return GoTLSAppDataEvent{}, fmt.Errorf("decode go tls app data event: payload length %d exceeds buffer %d", event.PayloadLength, goTLSMaxPayload)
+	}
+	copy(event.Payload[:], raw[32:32+goTLSMaxPayload])
 	return event, nil
 }
 
@@ -177,6 +259,9 @@ func (l *GoTLSLoader) Close() error {
 	if l.reader != nil {
 		closeErr = errors.Join(closeErr, l.reader.Close())
 	}
+	if l.appDataReader != nil {
+		closeErr = errors.Join(closeErr, l.appDataReader.Close())
+	}
 	closeErr = errors.Join(closeErr, l.objects.Close())
 	return closeErr
 }
@@ -187,6 +272,10 @@ func (o goTLSObjects) Close() error {
 		o.ClientHandshakeEnter,
 		o.ServerHandshakeEnter,
 		o.ConnectionState,
+		o.WriteEnter,
+		o.WriteReturn,
+		o.ReadEnter,
+		o.ReadReturn,
 	} {
 		if prog != nil {
 			closeErr = errors.Join(closeErr, prog.Close())
@@ -194,7 +283,10 @@ func (o goTLSObjects) Close() error {
 	}
 	for _, m := range []*cebpf.Map{
 		o.Events,
+		o.AppDataEvents,
 		o.PIDNamespaceConfig,
+		o.ReadPending,
+		o.WritePending,
 	} {
 		if m != nil {
 			closeErr = errors.Join(closeErr, m.Close())
@@ -238,6 +330,8 @@ func goTLSUprobeAttachSpecs(objects goTLSObjects) []uprobeAttachSpec {
 		{symbol: "crypto/tls.(*Conn).clientHandshake", enter: objects.ClientHandshakeEnter, optional: true},
 		{symbol: "crypto/tls.(*Conn).serverHandshake", enter: objects.ServerHandshakeEnter, optional: true},
 		{symbol: "crypto/tls.(*Conn).ConnectionState", enter: objects.ConnectionState},
+		{symbol: "crypto/tls.(*Conn).Write", enter: objects.WriteEnter, ret: objects.WriteReturn, optional: true},
+		{symbol: "crypto/tls.(*Conn).Read", enter: objects.ReadEnter, ret: objects.ReadReturn, optional: true},
 	}
 }
 

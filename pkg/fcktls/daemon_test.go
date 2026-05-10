@@ -923,6 +923,7 @@ type goAttachCall struct {
 type stubGoTLSLoader struct {
 	attachCalls []goAttachCall
 	eventCh     chan ebpf.GoTLSEvent
+	appDataCh   chan ebpf.GoTLSAppDataEvent
 }
 
 type stubGoTLSInspector struct {
@@ -1030,6 +1031,17 @@ func (s *stubGoTLSLoader) ReadGoTLSEvent() (ebpf.GoTLSEvent, error) {
 	return event, nil
 }
 
+func (s *stubGoTLSLoader) ReadGoTLSAppDataEvent() (ebpf.GoTLSAppDataEvent, error) {
+	if s.appDataCh == nil {
+		return ebpf.GoTLSAppDataEvent{}, ringbuf.ErrClosed
+	}
+	event, ok := <-s.appDataCh
+	if !ok {
+		return ebpf.GoTLSAppDataEvent{}, ringbuf.ErrClosed
+	}
+	return event, nil
+}
+
 func (s *stubGoTLSLoader) Close() error { return nil }
 
 func (s stubGoTLSInspector) Inspect(pid int, connPtr uint64, probeKind ebpf.GoTLSProbeKind) (GoTLSInspection, bool, error) {
@@ -1057,6 +1069,18 @@ func newGnuTLSAppDataEvent(pid uint32, sessionPtr uint64, direction ebpf.GnuTLSA
 		SessionPtr:    sessionPtr,
 		Direction:     direction,
 		DataLen:       uint32(len(data)),
+		PayloadLength: uint32(len(data)),
+		Payload:       payload,
+	}
+}
+
+func newGoTLSAppDataEvent(pid uint32, connPtr uint64, direction ebpf.GoTLSAppDataDirection, data []byte) ebpf.GoTLSAppDataEvent {
+	var payload [512]byte
+	copy(payload[:], data)
+	return ebpf.GoTLSAppDataEvent{
+		PID:           pid,
+		ConnPtr:       connPtr,
+		Direction:     direction,
 		PayloadLength: uint32(len(data)),
 		Payload:       payload,
 	}
@@ -1150,6 +1174,76 @@ func TestDaemonMergesGoTLSMetadata(t *testing.T) {
 	}
 	if got, want := summary.Metadata.KeyStatusNote, "go key export not implemented; plaintext capture not implemented"; got != want {
 		t.Fatalf("KeyStatusNote = %q, want %q", got, want)
+	}
+}
+
+func TestDaemonCapturesGoTLSPlaintextStreams(t *testing.T) {
+	now := time.Date(2026, 5, 10, 15, 0, 0, 0, time.UTC)
+	var stdout bytes.Buffer
+	cfg, err := NewConfig("go-client", true, t.TempDir())
+	if err != nil {
+		t.Fatalf("NewConfig() error = %v", err)
+	}
+
+	d := &Daemon{
+		Config: cfg,
+		GoTLS:  &stubGoTLSLoader{},
+		GoInspector: stubGoTLSInspector{
+			ok: true,
+			inspection: GoTLSInspection{
+				Role:        "client",
+				SNI:         "example.com",
+				TLSVersion:  "TLS 1.3",
+				CipherSuite: "TLS_AES_128_GCM_SHA256",
+				ALPN:        "http/1.1",
+				KeyStatus:   KeyStatusUnavailable,
+			},
+		},
+		Monitor: NewProcessMonitor("go-client", staticExeResolver{
+			paths: map[int]string{1002: "/tmp/go-client"},
+		}),
+		Now:       func() time.Time { return now },
+		Stdout:    &stdout,
+		Artifacts: NewArtifactWriter(cfg.CacheRoot),
+		Store:     NewSessionStore(),
+	}
+	tracked := map[int]ProcessMatch{
+		1002: {PID: 1002, ExePath: "/tmp/go-client", Basename: "go-client"},
+	}
+	seen := map[int]bool{1002: false}
+	fds := make(map[SessionKey]int)
+	exited := map[int]time.Time{1002: now.Add(time.Second)}
+
+	d.handleGoTLSEvent(ebpf.GoTLSEvent{
+		PID:         1002,
+		TimestampNS: uint64(now.UnixNano()),
+		ConnPtr:     0xa,
+		ProbeKind:   ebpf.GoTLSProbeKindConnectionState,
+	}, tracked, seen, fds)
+	d.handleGoTLSAppDataEvent(newGoTLSAppDataEvent(1002, 0xa, ebpf.GoTLSAppDataDirectionWrite, []byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")), tracked)
+	d.handleGoTLSAppDataEvent(newGoTLSAppDataEvent(1002, 0xa, ebpf.GoTLSAppDataDirectionRead, []byte("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")), tracked)
+	d.flushExited(tracked, seen, fds, exited, time.Unix(1<<62, 0))
+
+	if !strings.Contains(stdout.String(), "GET / HTTP/1.1") || !strings.Contains(stdout.String(), "HTTP/1.1 200 OK") {
+		t.Fatalf("stdout = %q, want capture output", stdout.String())
+	}
+
+	requestPath := filepath.Join(cfg.CacheRoot, "pid-1002-ssl-0xa", "request.txt")
+	request, err := os.ReadFile(requestPath)
+	if err != nil {
+		t.Fatalf("ReadFile(request.txt) error = %v", err)
+	}
+	if !strings.Contains(string(request), "GET / HTTP/1.1") {
+		t.Fatalf("request.txt = %q, want HTTP request", request)
+	}
+
+	responsePath := filepath.Join(cfg.CacheRoot, "pid-1002-ssl-0xa", "response.txt")
+	response, err := os.ReadFile(responsePath)
+	if err != nil {
+		t.Fatalf("ReadFile(response.txt) error = %v", err)
+	}
+	if !strings.Contains(string(response), "HTTP/1.1 200 OK") || !strings.Contains(string(response), "hello") {
+		t.Fatalf("response.txt = %q, want HTTP response", response)
 	}
 }
 

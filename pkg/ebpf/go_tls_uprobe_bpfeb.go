@@ -12,6 +12,13 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type go_tls_uprobeGoTlsAppDataPending struct {
+	ConnPtr   uint64
+	BufferPtr uint64
+	DataLen   uint32
+	Pad       [4]uint8
+}
+
 type go_tls_uprobeGoTlsPidnsConfig struct {
 	Dev uint64
 	Ino uint64
@@ -61,15 +68,22 @@ type go_tls_uprobeSpecs struct {
 type go_tls_uprobeProgramSpecs struct {
 	GoTlsClientHandshakeEnter *ebpf.ProgramSpec `ebpf:"go_tls_client_handshake_enter"`
 	GoTlsConnectionState      *ebpf.ProgramSpec `ebpf:"go_tls_connection_state"`
+	GoTlsReadEnter            *ebpf.ProgramSpec `ebpf:"go_tls_read_enter"`
+	GoTlsReadReturn           *ebpf.ProgramSpec `ebpf:"go_tls_read_return"`
 	GoTlsServerHandshakeEnter *ebpf.ProgramSpec `ebpf:"go_tls_server_handshake_enter"`
+	GoTlsWriteEnter           *ebpf.ProgramSpec `ebpf:"go_tls_write_enter"`
+	GoTlsWriteReturn          *ebpf.ProgramSpec `ebpf:"go_tls_write_return"`
 }
 
 // go_tls_uprobeMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type go_tls_uprobeMapSpecs struct {
+	GoTlsAppDataEvents  *ebpf.MapSpec `ebpf:"go_tls_app_data_events"`
 	GoTlsEvents         *ebpf.MapSpec `ebpf:"go_tls_events"`
 	GoTlsPidnsConfigMap *ebpf.MapSpec `ebpf:"go_tls_pidns_config_map"`
+	GoTlsReadPending    *ebpf.MapSpec `ebpf:"go_tls_read_pending"`
+	GoTlsWritePending   *ebpf.MapSpec `ebpf:"go_tls_write_pending"`
 }
 
 // go_tls_uprobeVariableSpecs contains global variables before they are loaded into the kernel.
@@ -98,14 +112,20 @@ func (o *go_tls_uprobeObjects) Close() error {
 //
 // It can be passed to loadGo_tls_uprobeObjects or ebpf.CollectionSpec.LoadAndAssign.
 type go_tls_uprobeMaps struct {
+	GoTlsAppDataEvents  *ebpf.Map `ebpf:"go_tls_app_data_events"`
 	GoTlsEvents         *ebpf.Map `ebpf:"go_tls_events"`
 	GoTlsPidnsConfigMap *ebpf.Map `ebpf:"go_tls_pidns_config_map"`
+	GoTlsReadPending    *ebpf.Map `ebpf:"go_tls_read_pending"`
+	GoTlsWritePending   *ebpf.Map `ebpf:"go_tls_write_pending"`
 }
 
 func (m *go_tls_uprobeMaps) Close() error {
 	return _Go_tls_uprobeClose(
+		m.GoTlsAppDataEvents,
 		m.GoTlsEvents,
 		m.GoTlsPidnsConfigMap,
+		m.GoTlsReadPending,
+		m.GoTlsWritePending,
 	)
 }
 
@@ -121,14 +141,22 @@ type go_tls_uprobeVariables struct {
 type go_tls_uprobePrograms struct {
 	GoTlsClientHandshakeEnter *ebpf.Program `ebpf:"go_tls_client_handshake_enter"`
 	GoTlsConnectionState      *ebpf.Program `ebpf:"go_tls_connection_state"`
+	GoTlsReadEnter            *ebpf.Program `ebpf:"go_tls_read_enter"`
+	GoTlsReadReturn           *ebpf.Program `ebpf:"go_tls_read_return"`
 	GoTlsServerHandshakeEnter *ebpf.Program `ebpf:"go_tls_server_handshake_enter"`
+	GoTlsWriteEnter           *ebpf.Program `ebpf:"go_tls_write_enter"`
+	GoTlsWriteReturn          *ebpf.Program `ebpf:"go_tls_write_return"`
 }
 
 func (p *go_tls_uprobePrograms) Close() error {
 	return _Go_tls_uprobeClose(
 		p.GoTlsClientHandshakeEnter,
 		p.GoTlsConnectionState,
+		p.GoTlsReadEnter,
+		p.GoTlsReadReturn,
 		p.GoTlsServerHandshakeEnter,
+		p.GoTlsWriteEnter,
+		p.GoTlsWriteReturn,
 	)
 }
 

@@ -37,6 +37,7 @@ type gnuTLSReader interface {
 type goTLSReader interface {
 	AttachProcess(pid int, executablePath string) error
 	ReadGoTLSEvent() (ebpf.GoTLSEvent, error)
+	ReadGoTLSAppDataEvent() (ebpf.GoTLSAppDataEvent, error)
 	Close() error
 }
 
@@ -165,7 +166,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	gnutlsCh := make(chan ebpf.GnuTLSEvent, 64)
 	gnutlsAppCh := make(chan ebpf.GnuTLSAppDataEvent, 64)
 	goTLSCh := make(chan ebpf.GoTLSEvent, 64)
-	errCh := make(chan error, 6)
+	goTLSAppCh := make(chan ebpf.GoTLSAppDataEvent, 64)
+	errCh := make(chan error, 7)
 
 	go func() {
 		<-ctx.Done()
@@ -198,9 +200,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 		} else {
 			close(gnutlsAppCh)
 		}
+		if d.GoTLS != nil {
+			go pumpGoTLSAppDataEvents(d.GoTLS, goTLSAppCh, errCh)
+		} else {
+			close(goTLSAppCh)
+		}
 	} else {
 		close(appCh)
 		close(gnutlsAppCh)
+		close(goTLSAppCh)
 	}
 	if d.OnReady != nil {
 		d.OnReady()
@@ -209,7 +217,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
-	for procCh != nil || sslCh != nil || appCh != nil || gnutlsCh != nil || gnutlsAppCh != nil || goTLSCh != nil {
+	for procCh != nil || sslCh != nil || appCh != nil || gnutlsCh != nil || gnutlsAppCh != nil || goTLSCh != nil || goTLSAppCh != nil {
 		select {
 		case <-ctx.Done():
 			for pid, match := range tracked {
@@ -259,6 +267,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 				continue
 			}
 			d.handleGoTLSEvent(event, tracked, seenTLS, fdBySession)
+		case event, ok := <-goTLSAppCh:
+			if !ok {
+				goTLSAppCh = nil
+				continue
+			}
+			d.handleGoTLSAppDataEvent(event, tracked)
 		}
 	}
 
@@ -516,6 +530,26 @@ func (d *Daemon) handleGnuTLSAppDataEvent(event ebpf.GnuTLSAppDataEvent, tracked
 	}
 	_ = d.Store.AppendChunk(PlaintextChunk{
 		Key:        SessionKey{PID: int(event.PID), SSLPointer: event.SessionPtr},
+		Direction:  direction,
+		ObservedAt: time.Unix(0, int64(event.TimestampNS)),
+		Data:       append([]byte(nil), event.Payload[:event.PayloadLength]...),
+	})
+}
+
+func (d *Daemon) handleGoTLSAppDataEvent(event ebpf.GoTLSAppDataEvent, tracked map[int]ProcessMatch) {
+	if _, ok := tracked[int(event.PID)]; !ok || event.ConnPtr == 0 {
+		return
+	}
+
+	direction := StreamDirectionClientToServer
+	if event.Direction == ebpf.GoTLSAppDataDirectionRead {
+		direction = StreamDirectionServerToClient
+	}
+	if event.PayloadLength > uint32(len(event.Payload)) {
+		return
+	}
+	_ = d.Store.AppendChunk(PlaintextChunk{
+		Key:        SessionKey{PID: int(event.PID), SSLPointer: event.ConnPtr},
 		Direction:  direction,
 		ObservedAt: time.Unix(0, int64(event.TimestampNS)),
 		Data:       append([]byte(nil), event.Payload[:event.PayloadLength]...),
@@ -907,6 +941,20 @@ func pumpGoTLSEvents(reader goTLSReader, out chan<- ebpf.GoTLSEvent, errCh chan<
 		if err != nil {
 			if !errors.Is(err, ringbuf.ErrClosed) {
 				errCh <- fmt.Errorf("read go tls event: %w", err)
+			}
+			return
+		}
+		out <- event
+	}
+}
+
+func pumpGoTLSAppDataEvents(reader goTLSReader, out chan<- ebpf.GoTLSAppDataEvent, errCh chan<- error) {
+	defer close(out)
+	for {
+		event, err := reader.ReadGoTLSAppDataEvent()
+		if err != nil {
+			if !errors.Is(err, ringbuf.ErrClosed) {
+				errCh <- fmt.Errorf("read go tls app data event: %w", err)
 			}
 			return
 		}

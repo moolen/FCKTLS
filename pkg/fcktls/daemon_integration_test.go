@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -466,7 +467,7 @@ func TestE2EGoTLSClientStopOnExecAttach(t *testing.T) {
 	defer server.Close()
 
 	cacheRoot := t.TempDir()
-	cfg, err := NewConfig(targetName, false, cacheRoot)
+	cfg, err := NewConfig(targetName, true, cacheRoot)
 	if err != nil {
 		t.Fatalf("NewConfig() error = %v", err)
 	}
@@ -531,7 +532,7 @@ func TestE2EGoTLSClientStopOnExecAttach(t *testing.T) {
 		t.Fatalf("client output = %q, want response body", output)
 	}
 
-	_, summaryPath, err := waitForSessionSummary(cacheRoot, 10*time.Second)
+	sessionDir, summaryPath, err := waitForSessionSummary(cacheRoot, 10*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -570,6 +571,31 @@ func TestE2EGoTLSClientStopOnExecAttach(t *testing.T) {
 	}
 	if got := summary.Metadata.KeyStatusNote; !strings.Contains(got, "go key export not implemented") {
 		t.Fatalf("KeyStatusNote = %q, want go key export not implemented", got)
+	}
+	if got, want := summary.Metadata.CaptureMode, CaptureModeCapture; got != want {
+		t.Fatalf("CaptureMode = %q, want %q", got, want)
+	}
+
+	requestPath := filepath.Join(sessionDir, "request.txt")
+	request, err := os.ReadFile(requestPath)
+	if err != nil {
+		t.Fatalf("ReadFile(request.txt) error = %v", err)
+	}
+	serverTarget, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("url.Parse(server.URL) error = %v", err)
+	}
+	if !strings.Contains(string(request), "GET / HTTP/1.1") || !strings.Contains(string(request), "Host: "+serverTarget.Hostname()) {
+		t.Fatalf("request.txt = %q, want HTTP request", request)
+	}
+
+	responsePath := filepath.Join(sessionDir, "response.txt")
+	response, err := os.ReadFile(responsePath)
+	if err != nil {
+		t.Fatalf("ReadFile(response.txt) error = %v", err)
+	}
+	if !strings.Contains(string(response), "HTTP/1.1 200 OK") || !strings.Contains(string(response), "go-tls-ok") {
+		t.Fatalf("response.txt = %q, want HTTP response", response)
 	}
 }
 

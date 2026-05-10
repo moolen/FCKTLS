@@ -70,6 +70,9 @@ func formatHTTPRequest(data []byte) (HTTPFormat, bool) {
 
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "%s %s %s\n", req.Method, req.URL.RequestURI(), req.Proto)
+	if req.Host != "" {
+		fmt.Fprintf(&builder, "Host: %s\n", req.Host)
+	}
 	writeSortedHeaders(&builder, req.Header)
 	if len(body) > 0 {
 		builder.WriteString("\n")
